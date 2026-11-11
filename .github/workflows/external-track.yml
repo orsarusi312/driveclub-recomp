@@ -5,6 +5,9 @@ on:
     paths:
       - 'tools/track_import/**'
       - 'tools/modkit/**'
+      - 'src/runtime_track_probe.h'
+      - 'src/runtime_pad.c'
+      - 'tools/track_probe_test.c'
       - '.github/workflows/external-track.yml'
 permissions:
   contents: read

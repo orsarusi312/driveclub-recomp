@@ -1017,11 +1017,67 @@ static void surface_feel(uintptr_t vehicle, const float *st) {
     }
     if (any && !ffb_tex_live) { ffb_tex_live=true; printf("Runtime: FFB road: each front tyre rolls over its surface's own bumps (in place of the game's kerb and surface waves)\n"); }
 }
+/* Opt-in track evidence uses the existing signature-checked FFB hook, even with
+ * the game FFB model. It adds no hooks and never changes guest state. */
+#if BB_DIAGNOSTICS
+#include "runtime_track_probe.h"
+static bool track_probe_guest_read(void *context, uint64_t address, void *out, size_t size) {
+    (void)context;
+    if (address>UINTPTR_MAX || size>UINTPTR_MAX-(uintptr_t)address) return false;
+    return car_dump_read((uintptr_t)address,out,size);
+}
+static void track_probe_step(uintptr_t state, uintptr_t vehicle) {
+    static int enabled=-1;
+    static unsigned char busy;
+    static DcTrackProbeGate gate;
+    /* The callback normally runs on the player physics thread. Skip concurrent
+     * arrivals rather than blocking it or racing the diagnostic counters. */
+    if (__atomic_test_and_set(&busy,__ATOMIC_ACQUIRE)) return;
+    if (enabled<0) {
+        const char *env=BB_DIAGNOSTIC_ENV("BB_TRACK_PROBE");
+        enabled=env && !strcmp(env,"1");
+        if (enabled) printf("TrackProbe: enabled schema=1 interval_ms=500 max_samples=600 read_only=1 normals=unavailable\n");
+    }
+    if (!enabled) { __atomic_clear(&busy,__ATOMIC_RELEASE); return; }
+    const uint64_t stamp=now_us();
+    const int action=dc_track_probe_due(&gate,state,vehicle,stamp);
+    if (action==DC_TRACK_PROBE_RELEASE) printf("TrackProbe: release epoch=%u\n",gate.epoch);
+    if (action==DC_TRACK_PROBE_LIMIT) printf("TrackProbe: sample_limit=600 restart_process_for_more=1\n");
+    if (action==DC_TRACK_PROBE_SAMPLE) {
+        DcTrackProbeSample sample;
+        dc_track_probe_capture(track_probe_guest_read,NULL,state,vehicle,&sample);
+        printf("TrackProbe: sample=%u epoch=%u us=%llu state=%p vehicle=%p pose_valid=%d center=%.6f,%.6f,%.6f heading_rad=%.6f\n",
+            gate.samples,gate.epoch,(unsigned long long)stamp,(void *)state,(void *)vehicle,sample.pose_valid,
+            sample.pose_valid ? sample.center[0] : 0.0,sample.pose_valid ? sample.center[1] : 0.0,
+            sample.pose_valid ? sample.center[2] : 0.0,sample.pose_valid ? sample.heading : 0.0);
+        for (unsigned w=0;w<4;++w) {
+            const DcTrackProbeWheel *wheel=&sample.wheels[w];
+            if (wheel->valid) printf("TrackProbe: sample=%u wheel=%u position=%.6f,%.6f,%.6f load_N=%.3f\n",
+                gate.samples,w,(double)wheel->position[0],(double)wheel->position[1],(double)wheel->position[2],(double)wheel->load);
+            else printf("TrackProbe: sample=%u wheel=%u invalid_position_or_load=1\n",gate.samples,w);
+            for (unsigned k=0;k<3;++k) {
+                const DcTrackProbeSurface *surface=&wheel->surfaces[k];
+                printf("TrackProbe: sample=%u wheel=%u surface_slot=%u ptr=%p weight_valid=%d weight=%.6f valid=%d",
+                    gate.samples,w,k,(void *)(uintptr_t)surface->address,surface->weight_valid,
+                    surface->weight_valid ? (double)surface->weight : 0.0,surface->valid);
+                if (surface->valid) printf(" kind=%d grip_28=%.6f grip_30=%.6f bump_m=%.6f wavelength_m=%.6f",
+                    surface->kind,(double)surface->grip_28,(double)surface->grip_30,
+                    (double)surface->bump_height,(double)surface->bump_length);
+                printf("\n");
+            }
+        }
+    }
+    __atomic_clear(&busy,__ATOMIC_RELEASE);
+}
+#else
+#define track_probe_step(state, vehicle) ((void)0)
+#endif
 /* caller_rbp and ret: the caller's frame and the return address, passed in by the patched code */
 static ABI void ffb_inputs_hook(uint8_t *obj, const uint8_t *in, const uintptr_t *caller, uintptr_t ret) {
     memcpy(obj+0xf4,in,0x30);
     if (ret!=runtime_image_base+0xd93c3e) return;
     if (!in[0]) {   /* no car under the player's control */
+        track_probe_step(0,0);
         tyre_grip_release();
         ffb_tex_amp[0]=ffb_tex_amp[1]=0.0f;
         surface_nknown=0;
@@ -1034,6 +1090,7 @@ static ABI void ffb_inputs_hook(uint8_t *obj, const uint8_t *in, const uintptr_t
     const uintptr_t state=*(const uintptr_t *)(iface+0x8), setup=*(const uintptr_t *)(iface+0x20), sim=*(const uintptr_t *)(setup+0x8);
     if (state!=ffb_car.state || setup!=ffb_car.setup) printf("Runtime: FFB physics: car state %p, setup %p, drivetrain %p\n",(void *)state,(void *)setup,(void *)sim);
     ffb_car.state=state; ffb_car.setup=setup; ffb_car.sim=sim;
+    track_probe_step(state,sim);
     __atomic_store_n(&ffb_car.step_us,now_us(),__ATOMIC_RELEASE);
     diff_override(sim);
     tyre_watch();

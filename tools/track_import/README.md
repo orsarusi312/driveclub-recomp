@@ -18,3 +18,7 @@ an experimental **visual slot replacement** via dcmod. It does not create new
 DriveClub physics, spawn points, boundaries, lap timing or AI. Generated RPKs
 inherit game assets and must stay local. The committed flat loop and fixture
 source contain original data only. Source is GPL-2.0-or-later.
+
+The [continuation report](../../docs/modding/external-track-progress.md) covers
+v2 collision/spawn authoring, GLB/glTF dependency preflight, native contact
+diagnostics, current status and transfer instructions. V2 is offline only.
