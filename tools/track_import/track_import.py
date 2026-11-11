@@ -272,6 +272,16 @@ def stage(config, bridge_path, dcmod, output):
     output = Path(output).resolve()
     require(not output.exists(), 'output already exists; choose a new staging folder')
     require(not template.is_relative_to(output), 'output contains template')
+    scan = subprocess.run([str(dcmod), 'mesh', 'scan', str(template)], text=True, capture_output=True)
+    require(scan.returncode == 0, 'mesh compatibility scan failed (rebuild dcmod): ' + scan.stderr.strip())
+    compatibility = json.loads(scan.stdout)
+    selected = next((s for s in compatibility['slots'] if s['target'] == target), None)
+    require(selected is not None, 'target not recognized by mesh scanner: ' + target)
+    # UV-less input can use a slot without UVs; all normal/isolation checks remain mandatory.
+    blockers = [b for b in selected['blockers'] if b != 'no_decoded_uv_for_flat_loop' or road['uvs'] is not None]
+    require(not blockers, target + ': ' + ', '.join(blockers) +
+            '; inspect dcmod mesh scan PACK (vertex_streams includes format IDs and raw field kind/type/index); '
+            'candidate slots: ' + ', '.join(compatibility['candidates'][:3]))
     # Export the exact slot to prove the name is present before the legacy importer is called.
     with tempfile.TemporaryDirectory(prefix='dc-road-') as tmp:
         tmp = Path(tmp)

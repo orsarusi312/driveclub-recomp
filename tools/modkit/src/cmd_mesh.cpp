@@ -24,6 +24,7 @@ int Usage() {
     std::puts(
         "dcmod mesh: model geometry of resource packs as glTF 2.0 (.glb)\n"
         "\n"
+        "  dcmod mesh scan PACK                        read-only JSON compatibility report and ranked candidates\n"
         "  dcmod mesh info PACK                        the sub meshes: name, vertices, triangles\n"
         "  dcmod mesh export PACK -o FILE.glb [NAME...]  one glTF mesh per sub mesh (names may use * and ?)\n"
         "  dcmod mesh materials PACK [SUBMESH]         the materials of the pack, or of the mesh of a sub mesh\n"
@@ -114,6 +115,7 @@ Fields ParseFields(const RpkResource* fmt, uint32_t stride) {
     Fields f;
     if (!fmt || fmt->data.size() < 21) return f;
     const size_t n = fmt->data[20];
+    if (n > (fmt->data.size() - 21) / 5) return f;
     uint32_t at = 0;
     for (size_t k = 0; k < n && 21 + k * 5 + 5 <= fmt->data.size(); ++k) {
         const uint8_t kind = fmt->data[21 + k * 5], type = fmt->data[22 + k * 5];
@@ -229,6 +231,94 @@ std::vector<Sub> FindSubs(const RpkPack& pack) {
         }
     }
     return out;
+}
+
+// Reports the same slot interpretation used by ImportSub; never mutates a pack.
+Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs) {
+    Json report = Json::Object(), slots = Json::Array(), candidates = Json::Array();
+    std::vector<const Sub*> ranked;
+    for (const Sub& s : subs) {
+        Json row = Json::Object(), blockers = Json::Array(), warnings = Json::Array(), streams = Json::Array();
+        row.Set("target", s.name); row.Set("vertices", s.vertices()); row.Set("triangles", s.count / 3);
+        row.Set("normal_decoded", s.normal_off >= 0); row.Set("tangent_decoded", s.tangent_off >= 0);
+        row.Set("uv_decoded", s.uv_off >= 0); row.Set("skinned", s.skin != 0);
+        row.Set("position_buffer", HexId(s.pos)); row.Set("attribute_buffer", HexId(s.attr));
+        row.Set("index_buffer", HexId(s.ib)); row.Set("position_half_float", s.half);
+        const RpkResource& mesh = *pack.Find(s.mesh);
+        std::string reason = "no_attribute_stream_with_matching_vertex_count";
+        for (uint64_t id : mesh.deps) {
+            const RpkResource* vb = pack.Find(id);
+            if (!vb || vb->Type() != unsigned(RpkTypeFromName("vertex_buffer"))) continue;
+            Json stream = Json::Object(), fields = Json::Array();
+            stream.Set("id", HexId(id)); stream.Set("selected_attributes", id == s.attr);
+            stream.Set("vertices", VbCount(*vb)); stream.Set("stride", Rd16(vb->data.data()+22));
+            const RpkResource* fmt = vb->deps.empty() ? nullptr : pack.Find(vb->deps[0]);
+            stream.Set("format_id", vb->deps.empty() ? "" : HexId(vb->deps[0]));
+            bool complete = fmt && fmt->data.size() >= 21 && fmt->data.size() >= 21u + size_t(fmt->data[20])*5;
+            bool declared = false, supported = false;
+            if (complete) for (size_t k=0; k<fmt->data[20]; ++k) {
+                const size_t at=21+k*5;
+                Json f=Json::Object(); f.Set("kind", int(fmt->data[at])); f.Set("type", int(fmt->data[at+1]));
+                f.Set("index", int(fmt->data[at+2])); fields.Push(f);
+                if (fmt->data[at]==2) { declared=true; supported |= fmt->data[at+1]==15; }
+            }
+            stream.Set("format_complete", complete); stream.Set("fields", fields);
+            stream.Set("decoder_stride_matches", complete && ParseFields(fmt,Rd16(vb->data.data()+22)).whole);
+            if (id == s.attr) {
+                if (!fmt) reason="attribute_format_resource_missing_from_pack";
+                else if (!complete) reason="attribute_format_descriptor_truncated";
+                else if (!declared) reason="no_normal_semantic_in_selected_descriptor";
+                else if (!supported) reason="normal_semantic_present_but_type_unsupported";
+                else if (!ParseFields(fmt,s.stride).whole) reason="normal_present_but_decoded_layout_does_not_match_stride";
+                else reason="decoded";
+            }
+            streams.Push(stream);
+        }
+        row.Set("normal_status", reason); row.Set("vertex_streams", streams);
+        if (s.normal_off < 0) blockers.Push(reason);
+        if (s.uv_off < 0) blockers.Push("no_decoded_uv_for_flat_loop");
+        if (s.skin) blockers.Push("skinned_slot_not_a_static_geometry_candidate");
+        size_t previous=0;
+        Json shares=Json::Array(), index_shares=Json::Array();
+        for (const Sub& other:subs) {
+            if (&other != &s && (other.pos==s.pos || (s.attr && other.attr==s.attr))) shares.Push(other.name);
+            if (&other != &s && other.ib==s.ib) index_shares.Push(other.name);
+            if (other.mesh==s.mesh) for (size_t at:other.recs)
+                if (at<s.recs.front()) previous=std::max(previous,at+18);
+        }
+        bool independent = s.attr != 0;
+        for (size_t at:s.recs) {
+            independent &= LastMention(mesh.data,s.pos,at)>=long(previous) && LastMention(mesh.data,s.attr,at)>=long(previous);
+        }
+        row.Set("shared_buffer_slots", shares); row.Set("shared_index_buffer_slots", index_shares);
+        row.Set("independent_buffer_mentions", independent);
+        if (!independent) blockers.Push("buffer_mentions_missing_or_shared_with_previous_slot");
+        Bytes draw; Wr32(draw,3); Wr32(draw,s.lo); Wr32(draw,0); Wr32(draw,s.first); Wr32(draw,s.count);
+        bool has_draw=std::search(mesh.data.begin(),mesh.data.end(),draw.begin(),draw.end())!=mesh.data.end();
+        row.Set("draw_table_found",has_draw);
+        if (!has_draw) blockers.Push("draw_table_entry_not_found");
+        if (s.tangent_off<0) warnings.Push("tangent_not_decoded_material_compatibility_unverified");
+        warnings.Push("scene_transform_culling_visibility_and_materials_unverified");
+        warnings.Push("classification_is_for_supported_flat_loop_format_not_runtime_success");
+        row.Set("blockers",blockers); row.Set("limitations",warnings);
+        row.Set("compatible",blockers.Items().empty());
+        row.Set("road_name_hint",Lower(s.name).find("road")!=std::string::npos);
+        if (blockers.Items().empty()) ranked.push_back(&s);
+        slots.Push(row);
+    }
+    std::sort(ranked.begin(),ranked.end(),[](const Sub* a,const Sub* b) {
+        bool ar=Lower(a->name).find("road")!=std::string::npos, br=Lower(b->name).find("road")!=std::string::npos;
+        if(ar!=br) return ar;
+        if(a->vertices()!=b->vertices()) return a->vertices()<b->vertices();
+        return a->name<b->name;
+    });
+    for(const Sub* s:ranked) candidates.Push(s->name);
+    Json required=Json::Array(); for(const std::string& name:pack.required) required.Push(name);
+    report.Set("required_packs",required);
+    report.Set("schema","dc-mesh-compatibility-1"); report.Set("slots",slots); report.Set("candidates",candidates);
+    report.Set("scope","recognized mesh slots only; missing external format dependencies are unresolved, not proof of absent normals");
+    report.Set("ranking","compatible static slots: road name hint then vertex count; visibility is not inferred");
+    return report;
 }
 
 // Normals and tangents are three signed 10 bit numbers in a 32 bit word (x in the lowest bits); checked on the Ferrari body
@@ -786,6 +876,12 @@ int RunMesh(const std::vector<std::string>& argv) {
     RpkPack pack = LoadPack(args, args.positional[1]);
     std::vector<Sub> subs = FindSubs(pack);
 
+    if (cmd == "scan") {
+        if (args.Has("-o") || args.Has("--output")) throw Error("scan writes JSON to stdout only; redirect to a new report file");
+        const std::string json = ScanMeshes(pack, subs).Dump();
+        std::fputs(json.c_str(), stdout);
+        return 0;
+    }
     if (cmd == "info") {
         size_t tris = 0;
         for (const Sub& s : subs) {

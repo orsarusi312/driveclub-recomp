@@ -68,7 +68,7 @@ FMOD banks. `info BANK`, `extract BANK -o DIR [NAME]`, `wav BANK NAME -o FILE.wa
 
 ## dcmod mesh
 
-Model geometry as glTF. `info PACK`, `export PACK -o FILE.glb [NAME...]`, `import PACK FILE.glb [--own-buffers|--isolate-buffers] -o OUT.rpk` (a part that grows gets vertex buffers of its own; skinned meshes keep bone numbers and weights), `materials PACK [SUBMESH]` and `material PACK TARGET SOURCE -o OUT` (a part uses another material of its mesh). See [models.md](models.md).
+Model geometry as glTF. `scan PACK` emits a read-only JSON slot compatibility report and ranked flat-loop candidates; see [mesh scanner](external-track-mesh-scan.md). `info PACK`, `export PACK -o FILE.glb [NAME...]`, `import PACK FILE.glb [--own-buffers|--isolate-buffers] -o OUT.rpk` (a part that grows gets vertex buffers of its own; skinned meshes keep bone numbers and weights), `materials PACK [SUBMESH]` and `material PACK TARGET SOURCE -o OUT` (a part uses another material of its mesh). See [models.md](models.md).
 
 ## dcmod shader
 
