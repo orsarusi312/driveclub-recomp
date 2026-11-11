@@ -14,6 +14,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace dcmod {
 
@@ -133,6 +134,19 @@ std::vector<Sub> FindSubs(const RpkPack& pack) {
     std::vector<Sub> out;
     for (const RpkResource& m : pack.resources) {
         if (int(m.Type()) != mesh_type) continue;
+        // Pack parsing validates the container, not stream-specific sizes. Refuse
+        // malformed count/stride fields before FindSubs dereferences any stream.
+        for (uint64_t id : m.deps) {
+            const RpkResource* stream = pack.Find(id);
+            if (!stream || (int(stream->Type()) != vb_type && int(stream->Type()) != ib_type)) continue;
+            if (stream->data.size() < 28) throw Error("truncated mesh buffer " + HexId(id));
+            const size_t stride = int(stream->Type()) == ib_type ? 2u : Rd16(stream->data.data() + 22);
+            const size_t count = VbCount(*stream);
+            if (!stride || count > (stream->data.size() - 28) / stride)
+                throw Error("invalid mesh buffer count/stride " + HexId(id));
+            if (PositionKind(*stream) && stride < (PositionKind(*stream) == 2 ? 6u : 12u))
+                throw Error("invalid position stride " + HexId(id));
+        }
         std::vector<uint64_t> poss, ibs, attrs, skins;
         for (uint64_t d : m.deps) {
             const RpkResource* r = pack.Find(d);
@@ -164,7 +178,7 @@ std::vector<Sub> FindSubs(const RpkPack& pack) {
             const uint32_t lo = Rd32(&m.data[i + 2]), hi = Rd32(&m.data[i + 6]), first = Rd32(&m.data[i + 10]), cnt = Rd32(&m.data[i + 14]);
             const uint64_t pos = nearest(poss, i), ib = nearest(ibs, i);
             const uint32_t nv = VbCount(*pack.Find(pos)), ni = VbCount(*pack.Find(ib));
-            if (!cnt || cnt % 3 || hi < lo || hi >= nv || first + cnt > ni) continue;
+            if (!cnt || cnt % 3 || hi < lo || hi >= nv || uint64_t(first) + cnt > ni) continue;
             const uint8_t* ix = &pack.Find(ib)->data[28 + first * 2];
             bool inside = true;  // a record whose indices leave its range is not a sub mesh
             for (uint32_t t = 0; t < cnt && inside; ++t) inside = Rd16(ix + t * 2) >= lo && Rd16(ix + t * 2) <= hi;
@@ -486,7 +500,22 @@ RpkResource EmptyBufferLike(const RpkResource& src, uint64_t id) {
 
 void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool own_buffers, bool isolate_buffers, const Glb& g, const Json& prim, const std::vector<double>& p, const std::string& name) {
     const size_t nv_new = p.size() / 3;
-    if (!nv_new) throw Error(name + ": has no vertices");
+    if (!nv_new || p.size() % 3 || nv_new > 65535) throw Error(name + ": needs 1..65535 complete vertices");
+    for (double value : p) {
+        if (!std::isfinite(value) || std::fabs(value) > (sub.half ? 65504.0 : double(std::numeric_limits<float>::max())))
+            throw Error(name + ": position is non-finite or exceeds the destination format");
+    }
+    if (isolate_buffers && (!prim.Has("indices") || prim.GetInt("mode", 4) != 4))
+        throw Error(name + ": isolated imports require an indexed triangle list");
+    // Check indices before any floating-point-to-integer conversion or buffer edit.
+    if (prim.Has("indices")) {
+        const auto indices = Accessor(g, prim.GetInt("indices"), 1);
+        if (indices.empty() || indices.size() % 3) throw Error(name + ": indices are not a triangle list");
+        for (double index : indices) {
+            if (!std::isfinite(index) || index < 0 || std::floor(index) != index || index >= double(nv_new))
+                throw Error(name + ": invalid triangle index");
+        }
+    }
     std::vector<double> uvs;
     if (sub.uv_off >= 0 && prim.Find("attributes")->Has("TEXCOORD_0")) {
         uvs = Accessor(g, prim.Find("attributes")->GetInt("TEXCOORD_0"), 2);
@@ -537,7 +566,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
         if (nrm.size() != nv_new * 3) nrm.clear();
     }
     std::vector<std::array<float, 3>> calc_n(nv_new, std::array<float, 3>{0, 0, 0}), calc_t(nv_new, std::array<float, 3>{0, 0, 0});
-    if (nv_new > nv && prim.Has("indices")) {
+    if ((nv_new > nv || isolate_buffers) && prim.Has("indices")) {
         const std::vector<double> ix = Accessor(g, prim.GetInt("indices"), 1);
         for (size_t t = 0; t + 2 < ix.size(); t += 3) {
             size_t v[3];
@@ -570,7 +599,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
             const float dot = old[0] * n[0] + old[1] * n[1] + old[2] * n[2];
             const float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
             const float lo = std::sqrt(old[0] * old[0] + old[1] * old[1] + old[2] * old[2]);
-            if (l > 0 && (lo == 0 || dot / (l * lo) < 0.9995f)) set = true;
+            if (l > 0 && (isolate_buffers || lo == 0 || dot / (l * lo) < 0.9995f)) set = true;
         } else if (i >= nv) {
             n = calc_n[i], set = true;
         }
@@ -578,7 +607,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
             const uint32_t u = Enc10(n);
             std::memcpy(dst + sub.normal_off, &u, 4);
         }
-        if (sub.tangent_off >= 0 && i >= nv && !uvs.empty()) {
+        if (sub.tangent_off >= 0 && (i >= nv || isolate_buffers) && !uvs.empty()) {
             std::array<float, 3> t = calc_t[i];
             const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
             if (len > 0) {

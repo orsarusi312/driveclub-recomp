@@ -8,6 +8,8 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+import math
 
 TOOL = Path(__file__).resolve().parents[1] / 'track_import.py'
 spec = importlib.util.spec_from_file_location('track_import', TOOL)
@@ -82,6 +84,22 @@ class TrackTests(unittest.TestCase):
             self.mesh.write_bytes(data)
             with self.assertRaises(t.Invalid): t.read_glb(self.mesh)
 
+    def test_structural_json_errors_are_diagnostics(self):
+        for value in ([], None, {'schema': 'dc-external-track-1', 'id': []},
+                      {'schema': 'dc-external-track-1', 'id': 'test', 'units': 'metres', 'axes': 'RH_Y_UP', 'mesh': 5}):
+            self.config.write_text(json.dumps(value))
+            result = subprocess.run([os.sys.executable, str(TOOL), 'check', str(self.config)], capture_output=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b'track-import:', result.stderr)
+            self.assertNotIn(b'Traceback', result.stderr)
+        original = self.mesh.read_bytes()
+        for change in [lambda r: r.update(asset=None), lambda r: r.update(buffers=[None]),
+                       lambda r: r.update(nodes=None), lambda r: r.update(accessors=[[]]),
+                       lambda r: r['bufferViews'][0].update(byteOffset=2),
+                       lambda r: r['bufferViews'][0].update(byteStride=13)]:
+            self.mesh.write_bytes(mutate_glb(original, change))
+            with self.assertRaises(t.Invalid): t.read_glb(self.mesh)
+
     def test_reject_bad_triangles_and_nan(self):
         for kind in ['nan', 'degenerate', 'index']:
             road = copy.deepcopy(self.road)
@@ -130,6 +148,46 @@ class TrackTests(unittest.TestCase):
             t.run_dcmod(exe, 'mesh', 'export', folder/'files/worlds/test.rpk', '-o', untouched, '0008000000000001_1_road_slot')
             self.assertEqual(untouched.read_bytes(), original.read_bytes())
         self.mesh.write_bytes(t.make_glb(self.road))
+        # Small normal changes used to retain donor normals within the legacy
+        # edit tolerance; an external replacement must publish the supplied normal.
+        road = copy.deepcopy(self.road)
+        road['normals'] = [[0.01, math.sqrt(1-0.01**2), 0] for _ in road['positions']]
+        self.mesh.write_bytes(t.make_glb(road))
+        t.stage(self.config, bridge, exe, self.root/'normal-change')
+        self.mesh.write_bytes(t.make_glb(self.road))
+        # The 10 km authoring limit is local to the source, not a translated RPK.
+        shifted = json.loads(bridge.read_text()); shifted['translation'] = [12000, 2, 3]
+        bridge.write_text(json.dumps(shifted))
+        t.stage(self.config, bridge, exe, self.root/'translated')
+        shifted['translation'] = [1, 2, 3]; bridge.write_text(json.dumps(shifted))
+        with mock.patch.object(t.shutil, 'copyfile', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError): t.stage(self.config, bridge, exe, self.root/'copy-failed')
+        self.assertFalse((self.root/'copy-failed').exists())
+        with mock.patch.object(Path, 'rename', side_effect=OSError('publish failed')):
+            with self.assertRaises(OSError): t.stage(self.config, bridge, exe, self.root/'publish-failed')
+        self.assertFalse((self.root/'publish-failed').exists())
+        self.assertFalse(list(self.root.glob('.dc-road-stage-*')))
+        # Direct CLI calls must also reject unsafe indices before float casts,
+        # and refuse isolated imports that would retain old absolute indices.
+        canonical = t.make_glb(self.road, '0008000000000001_0_road_slot')
+        malformed = self.root/'malformed.glb'
+        for change in [lambda r: r['meshes'][0]['primitives'][0].pop('indices'),
+                       lambda r: r['accessors'][-1].update(componentType=5126)]:
+            malformed.write_bytes(mutate_glb(canonical, change))
+            result = subprocess.run([str(exe), 'mesh', 'import', str(template), str(malformed),
+                                     '--isolate-buffers', '-o', str(self.root/'unsafe.rpk')], capture_output=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertFalse((self.root/'unsafe.rpk').exists())
+        # Container-valid but semantically truncated vertex buffers must fail
+        # before the finder scans records against invalid count/stride metadata.
+        damaged = bytearray(before)
+        header = b'EVOSLITL' + struct.pack('<Q', 0x0003000000000001)
+        at = damaged.index(header)
+        struct.pack_into('<I', damaged, at+24, 0xffffffff)
+        invalid_pack = self.root/'invalid-buffer.rpk'; invalid_pack.write_bytes(damaged)
+        result = subprocess.run([str(exe), 'mesh', 'info', str(invalid_pack)], capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b'invalid mesh buffer', result.stderr)
         with self.assertRaises(t.Invalid): t.stage(self.config, bridge, exe, self.root/'mod')
         broken = json.loads(bridge.read_text()); broken['target']='0008000000000001_9_missing'
         bridge.write_text(json.dumps(broken))

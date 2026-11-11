@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -37,7 +38,17 @@ def vector(value, n, label):
     return value
 
 
-def read_glb(path):
+def mapping(value, label):
+    require(isinstance(value, dict), f'{label}: expected object')
+    return value
+
+
+def objects(value, label):
+    require(isinstance(value, list) and all(isinstance(v, dict) for v in value), f'{label}: expected array of objects')
+    return value
+
+
+def read_glb(path, *, max_position=10000):
     data = Path(path).read_bytes()
     require(len(data) >= 20, 'truncated GLB header')
     magic, version, size = struct.unpack_from('<III', data)
@@ -51,11 +62,11 @@ def read_glb(path):
         chunks.append((kind, data[at:at + length]))
         at += length
     require([c[0] for c in chunks] == [0x4E4F534A, 0x004E4942], 'expected JSON then BIN only')
-    root = json.loads(chunks[0][1])
+    root = mapping(json.loads(chunks[0][1]), 'glTF root')
     binary = chunks[1][1]
-    require(root.get('asset', {}).get('version') == '2.0', 'expected glTF 2.0')
+    require(mapping(root.get('asset', {}), 'asset').get('version') == '2.0', 'expected glTF 2.0')
     require(not root.get('extensionsRequired') and not root.get('extensionsUsed'), 'extensions unsupported; export plain glTF')
-    buffers = root.get('buffers', [])
+    buffers = objects(root.get('buffers', []), 'buffers')
     require(len(buffers) == 1 and 'uri' not in buffers[0], 'one embedded buffer required')
     size = integer(buffers[0].get('byteLength'), 'buffer length')
     require(size <= len(binary) <= size + 3, 'buffer length mismatch')
@@ -63,13 +74,13 @@ def read_glb(path):
 
     def accessor(index, kind, types):
         integer(index, 'accessor index')
-        accs = root.get('accessors', [])
+        accs = objects(root.get('accessors', []), 'accessors')
         require(index < len(accs), 'missing accessor')
         acc = accs[index]
         require(acc.get('type') == kind and acc.get('componentType') in types, 'unsupported accessor format')
         require('sparse' not in acc and not acc.get('normalized'), 'sparse/normalized accessors unsupported')
         vi = integer(acc.get('bufferView'), 'bufferView')
-        views = root.get('bufferViews', [])
+        views = objects(root.get('bufferViews', []), 'bufferViews')
         require(vi < len(views), 'missing bufferView')
         view = views[vi]
         require(view.get('buffer', 0) == 0 and not view.get('extensions'), 'unsupported bufferView')
@@ -77,17 +88,21 @@ def read_glb(path):
         require(count <= 10_000_000, 'accessor count exceeds prototype limit')
         fmt = {5126: 'f', 5125: 'I', 5123: 'H', 5121: 'B'}[acc['componentType']]
         components = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3}[kind]
-        width = struct.calcsize('<' + fmt) * components
+        component_size = struct.calcsize('<' + fmt)
+        width = component_size * components
         stride = integer(view.get('byteStride', width), 'stride', width)
         start = integer(view.get('byteOffset', 0), 'view offset')
         length = integer(view.get('byteLength'), 'view length')
         offset = integer(acc.get('byteOffset', 0), 'accessor offset')
+        require(offset % component_size == 0 and (start + offset) % component_size == 0 and stride % component_size == 0, 'misaligned accessor')
+        if 'byteStride' in view:
+            require(4 <= stride <= 252 and stride % 4 == 0, 'invalid glTF byteStride')
         require(start + length <= len(binary) and offset + (count - 1) * stride + width <= length,
                 'accessor outside its bufferView')
         return [list(struct.unpack_from('<' + fmt * components, binary, start + offset + i * stride)) for i in range(count)]
 
     # Deliberately narrow contract: do not silently ignore scene transforms or instances.
-    nodes, meshes, scenes = root.get('nodes', []), root.get('meshes', []), root.get('scenes', [])
+    nodes, meshes, scenes = [objects(root.get(key, []), key) for key in ('nodes', 'meshes', 'scenes')]
     require(len(nodes) == len(meshes) == len(scenes) == 1 and root.get('scene', 0) == 0,
             'export one joined road object and one scene')
     node = nodes[0]
@@ -98,11 +113,11 @@ def read_glb(path):
                           ('matrix', [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])]:
         if key in node:
             require(vector(node[key], len(identity), key) == identity, 'bake object transforms before export')
-    primitives = meshes[0].get('primitives', [])
+    primitives = objects(meshes[0].get('primitives', []), 'primitives')
     require(len(primitives) == 1, 'one road primitive/material required; split large tracks into tiles later')
     prim = primitives[0]
     require(prim.get('mode', 4) == 4 and not prim.get('targets') and not prim.get('extensions'), 'triangle lists only')
-    attributes = prim.get('attributes', {})
+    attributes = mapping(prim.get('attributes', {}), 'attributes')
     require(set(attributes) <= {'POSITION', 'NORMAL', 'TEXCOORD_0'} and 'POSITION' in attributes,
             'only POSITION, NORMAL and TEXCOORD_0 supported')
     positions = accessor(attributes['POSITION'], 'VEC3', [5126])
@@ -110,7 +125,7 @@ def read_glb(path):
     require(3 <= len(positions) <= 65535, 'road needs 3..65535 vertices per mesh slot')
     for p in positions:
         vector(p, 3, 'position')
-        require(max(map(abs, p)) <= 10000, 'position beyond 10 km authoring envelope; rebase near origin')
+        require(max(map(abs, p)) <= max_position, f'position exceeds {max_position:g} m coordinate limit; rebase near origin')
     indices = [v[0] for v in accessor(prim['indices'], 'SCALAR', [5121, 5123, 5125])] if 'indices' in prim else list(range(len(positions)))
     require(indices and len(indices) % 3 == 0 and max(indices) < len(positions), 'invalid triangle indices')
     normals = accessor(attributes['NORMAL'], 'VEC3', [5126]) if 'NORMAL' in attributes else None
@@ -181,16 +196,17 @@ def surface_height(road, x, z):
 
 def load_track(config):
     config = Path(config).resolve()
-    spec = json.loads(config.read_text(encoding='utf-8'))
+    spec = mapping(json.loads(config.read_text(encoding='utf-8')), 'track config')
     require(spec.get('schema') == 'dc-external-track-1', 'unsupported track schema')
-    require(re.fullmatch(r'[a-z0-9_-]+', spec.get('id', '')) is not None, 'invalid track id')
+    require(isinstance(spec.get('id'), str) and re.fullmatch(r'[a-z0-9_-]+', spec['id']) is not None, 'invalid track id')
     require(spec.get('units') == 'metres' and spec.get('axes') == 'RH_Y_UP', 'expected metres and RH_Y_UP')
-    relative = PurePosixPath(spec.get('mesh', ''))
+    require(isinstance(spec.get('mesh'), str), 'mesh: expected relative path string')
+    relative = PurePosixPath(spec['mesh'])
     require(str(relative) != '.' and not relative.is_absolute() and '..' not in relative.parts and '\\' not in str(relative), 'mesh must be package relative')
     mesh = (config.parent / str(relative)).resolve()
     require(mesh.is_relative_to(config.parent), 'mesh escapes package')
     road = read_glb(mesh)
-    spawn = spec.get('spawn', {})
+    spawn = mapping(spec.get('spawn', {}), 'spawn')
     p = vector(spawn.get('position'), 3, 'spawn.position')
     heading = spawn.get('heading_degrees')
     require(type(heading) in (int, float) and math.isfinite(heading), 'invalid spawn heading')
@@ -241,8 +257,9 @@ def stage(config, bridge_path, dcmod, output):
     """
     spec, road, report = load_track(config)
     bridge_path = Path(bridge_path).resolve()
-    bridge = json.loads(bridge_path.read_text(encoding='utf-8'))
+    bridge = mapping(json.loads(bridge_path.read_text(encoding='utf-8')), 'bridge config')
     require(bridge.get('schema') == 'dc-visual-bridge-1', 'unsupported bridge schema')
+    require(isinstance(bridge.get('template'), str), 'template: expected local path string')
     template = (bridge_path.parent / bridge['template']).resolve()
     require(template.is_file() and template.suffix.lower() == '.rpk', 'expected local extracted template .rpk')
     game_path = bridge['game_path']
@@ -271,7 +288,7 @@ def stage(config, bridge_path, dcmod, output):
         run_dcmod(dcmod, 'mesh', 'import', template, tmp / 'mapped.glb', '--isolate-buffers', '-o', tmp / 'visual.rpk')
         # Read it back through the real exporter, checking that the new geometry survived quantization.
         run_dcmod(dcmod, 'mesh', 'export', tmp / 'visual.rpk', '-o', tmp / 'verify.glb', target)
-        actual = read_glb(tmp / 'verify.glb')
+        actual = read_glb(tmp / 'verify.glb', max_position=65504)
         require(actual['indices'] == road['indices'], 'RPK triangle round-trip mismatch')
         require(len(actual['positions']) == len(road['positions']), 'RPK vertex count mismatch')
         require(all(abs(a-b) <= max(0.002, abs(b)*0.001) for av, bv in zip(actual['positions'], road['positions']) for a, b in zip(av, bv)), 'RPK position round-trip mismatch')
@@ -284,13 +301,24 @@ def stage(config, bridge_path, dcmod, output):
         report.update(status='visual slot staged; in-game rendering unverified; NOT a playable new track',
                       game_path=game_path, target=target, translation=offset,
                       template_sha256=hashlib.sha256(template.read_bytes()).hexdigest())
-        # No output is created until all dcmod operations and geometry checks succeed.
-        output.mkdir(parents=True)
-        target_path = output / 'files' / game_path
-        target_path.parent.mkdir(parents=True)
-        target_path.write_bytes((tmp / 'visual.rpk').read_bytes())
-        (output / 'mod.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
-        (output / 'import-report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+        # Assemble beside the destination so every write succeeds before publication.
+        # Claim a new directory (mkdir cannot overwrite an existing directory/symlink)
+        # and clean it up if publication fails; never leave a half-written mod.
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.dc-road-stage-', dir=output.parent) as pending:
+            pending = Path(pending)
+            target_path = pending / 'files' / game_path
+            target_path.parent.mkdir(parents=True)
+            shutil.copyfile(tmp / 'visual.rpk', target_path)
+            (pending / 'mod.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+            (pending / 'import-report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+            output.mkdir()
+            try:
+                for item in pending.iterdir():
+                    item.rename(output / item.name)
+            except BaseException:
+                shutil.rmtree(output)
+                raise
     return report
 
 
