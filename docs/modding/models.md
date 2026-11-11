@@ -58,3 +58,13 @@ Only the geometry comes across: the part keeps the material (shader, textures) o
 
 A part is drawn with the material of the sub mesh it replaces (shader, textures). `dcmod mesh materials PACK SUBMESH` lists the materials the mesh of a sub mesh has, and `dcmod mesh material PACK TARGET SOURCE -o OUT` makes TARGET use the material of another sub mesh (or a material identifier) from that list. Checked in the game: the rear deck of the Ferrari 458, a carbon coloured panel, drawn with the material of the next part became silver. Only materials that the mesh already lists work: a material added to the mesh's dependencies (with the count of materials in the header raised, or not) made the game fault or hang while loading, so the command refuses it. A material must also fit the vertex data of the part (the tyre material on a body part faulted the game). A part that shares its material mention with the sub mesh before it in the mesh cannot get another one (the command says so).
 
+
+## Isolated external geometry
+
+`dcmod mesh import PACK FILE.glb --isolate-buffers -o OUT.rpk` allocates new
+position/attribute streams even for equal or smaller parts, protecting shared
+source vertices. Unlike `--own-buffers`, it does not depend on vertex growth.
+It requires usable attribute streams and independently referenced buffer
+mentions; unsupported slots fail rather than modifying shared geometry. Default
+import behavior is unchanged. This does not create scene nodes or colliders.
+The [external-road prototype](external-track-report.md) uses this flag.

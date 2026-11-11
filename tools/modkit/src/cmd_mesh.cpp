@@ -30,6 +30,7 @@ int Usage() {
         "                                              or a material identifier)\n"
         "  dcmod mesh import PACK FILE.glb [--own-buffers] -o OUT.rpk  write the pack again with the positions (and triangles) of the\n"
         "                                              glTF objects that came from it\n"
+        "  --isolate-buffers                            always relocate imported parts, including smaller ones\n"
         "\n"
         "PACK is a file or @path in the game's archive. Objects are named ID_N_NAME (the mesh's identifier and the\n"
         "sub mesh number); keep that prefix when renaming. An object may have more or fewer vertices and triangles\n"
@@ -483,7 +484,7 @@ RpkResource EmptyBufferLike(const RpkResource& src, uint64_t id) {
     return r;
 }
 
-void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool own_buffers, const Glb& g, const Json& prim, const std::vector<double>& p, const std::string& name) {
+void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool own_buffers, bool isolate_buffers, const Glb& g, const Json& prim, const std::vector<double>& p, const std::string& name) {
     const size_t nv_new = p.size() / 3;
     if (!nv_new) throw Error(name + ": has no vertices");
     std::vector<double> uvs;
@@ -495,6 +496,9 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
     RpkResource* av = sub.attr ? pack.Find(sub.attr) : nullptr;
     RpkResource* sv = sub.skin && sub.skin != sub.attr ? pack.Find(sub.skin) : nullptr;  // a stream of weights and bones of its own
     const uint32_t nv = sub.vertices();
+    // External geometry must not rewrite vertices shared by another scene part.
+    const bool grow = nv_new > nv || isolate_buffers;
+    if (isolate_buffers && !av) throw Error(name + ": cannot isolate without an attribute stream");
     // bone numbers and weights from the glTF object (JOINTS_0 and WEIGHTS_0)
     std::vector<double> jn, wt;
     if (sub.skin && prim.Find("attributes")->Has("JOINTS_0") && prim.Find("attributes")->Has("WEIGHTS_0")) {
@@ -593,7 +597,6 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
         old[0] = Clean(old[0]), old[1] = Clean(old[1]);  // a junk value (the export wrote 0 for it) counts as unchanged
         if (std::fabs(old[0] - now[0]) > 1e-6f * std::max(1.f, std::fabs(old[0])) || std::fabs(old[1] - now[1]) > 1e-6f * std::max(1.f, std::fabs(old[1]))) std::memcpy(dst + sub.uv_off, now, 8);
     };
-    const bool grow = nv_new > nv;
     if (!grow) {
         for (uint32_t i = 0; i < nv_new; ++i) {
             put_pos(&vb->data[28 + size_t(sub.lo + i) * sub.pos_stride], i);
@@ -605,8 +608,8 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
     // A part that grows is written whole at the end of the buffers (its old vertices stay unused), so its vertices
     // stay one range. Vertices that are new get the other vertex data (colour, weights) of the old one that is nearest.
     // A part may have buffers of its own, so that it does not depend on room in the shared ones: always with --own-buffers,
-    // and when the shared buffer is full.
-    const bool own = grow && av && (own_buffers || uint64_t(VbCount(*vb)) + nv_new > 65535);
+    // and when the shared buffer is full. --isolate-buffers also relocates parts that do not grow.
+    const bool own = grow && av && (own_buffers || isolate_buffers || uint64_t(VbCount(*vb)) + nv_new > 65535);
     RpkResource* dv = vb;
     RpkResource* da = av;
     RpkResource* ds = sv;
@@ -882,7 +885,7 @@ int RunMesh(const std::vector<std::string>& argv) {
             if (!sub) continue;
             const Json& prim = meshes->Items().at(size_t(node.GetInt("mesh"))).Find("primitives")->Items().at(0);
             const std::vector<double> p = Accessor(g, prim.Find("attributes")->GetInt("POSITION"), 3);
-            ImportSub(pack, *sub, subs, args.Has("--own-buffers"), g, prim, p, name);
+            ImportSub(pack, *sub, subs, args.Has("--own-buffers"), args.Has("--isolate-buffers"), g, prim, p, name);
             ++used;
         }
         if (!used) throw Error("none of the objects in the file came from this pack (their names start with the mesh identifier)");

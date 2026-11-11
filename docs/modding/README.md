@@ -24,6 +24,7 @@ The mod kit has three parts:
 | [Native plugins](plugins.md) | DLLs that hook the game's code (opt-in, for code you trust) |
 | [Post-processing filters](postfx.md) | A shader of your own over the game's picture, switched and tuned by a script |
 | [Car lights](lights.md) | Read and change the colour and brightness of a car's lights |
+| [External-track prototype](external-track-report.md) | investigation, original road importer, blockers and acceptance gates |
 | [Tracks](tracks.md) | what a track is, what can be changed, a copy of a track under a new name |
 | [Tutorial: a new car](tutorial-new-car.md) | clone a car, reshape it in Blender, share it as two mods |
 | [Shaders and graphics](shaders.md) | dump the game's shaders, edit the SPIR-V, replace them in a mod |

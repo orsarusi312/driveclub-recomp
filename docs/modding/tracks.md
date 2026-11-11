@@ -44,3 +44,12 @@ Checked in the game (hidden 1920x1080 runs): `canada_road_circuit_09_n` (a copy 
 Not covered: other kinds of tracks than the ones named `<country>_<kind>_<NN>_<variant>` with a circuit number, tracks whose scripts or tables are keyed in a way that was not met (`track clone` says when a script or table does not hold the name), the tour (`data/databases/dc.tour` lists events by track), and a change of the world's name length.
 
 How it was found, for the next track that fails: a plugin hook on the game's lookup function logs what it cannot find; the guest address of a fault gives the function (the kit's research folder has the Ghidra scripts); the fault `read access to 0000000000000018 at guest offset 0x780f7e` was the world not found by name, `0x69552e` was the map keyed by the CRC32 of a track name, and `0x662260` is the game's own assertion (a `INT 0x41` that prints a message with the call stack; a plugin hook there can read the message from the caller's stack at `rsp + 8 + 0x30`).
+
+## External-track development
+
+The [external-track foundation report](external-track-report.md) distinguishes
+original geometry injection from a new playable route. The prototype includes
+an original flat loop, a strict GLB validator and a tested isolated-buffer
+visual import bridge. Collision and race integration remain unresolved. See the
+[Windows testing guide](external-track-windows.md) and
+[private KN5 conversion preparation](external-track-conversion.md).

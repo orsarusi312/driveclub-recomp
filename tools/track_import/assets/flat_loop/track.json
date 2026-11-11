@@ -1,0 +1,15 @@
+{
+  "schema": "dc-external-track-1",
+  "id": "flat_loop",
+  "units": "metres",
+  "axes": "RH_Y_UP",
+  "mesh": "road.glb",
+  "spawn": {
+    "position": [
+      0,
+      0.75,
+      -25
+    ],
+    "heading_degrees": 90
+  }
+}

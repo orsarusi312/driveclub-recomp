@@ -1,0 +1,19 @@
+name: External road authoring tests
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tools/track_import/**'
+      - 'tools/modkit/**'
+      - '.github/workflows/external-track.yml'
+permissions:
+  contents: read
+jobs:
+  synthetic-import:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test real dcmod with original synthetic RPKs
+        run: bash tools/track_import/test.sh
+      - name: Existing modkit and ATRAC9 self-tests
+        run: bash tools/modkit/test.sh

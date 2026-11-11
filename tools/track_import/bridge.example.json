@@ -1,0 +1,7 @@
+{
+  "schema": "dc-visual-bridge-1",
+  "template": "template.rpk",
+  "game_path": "worlds/canada_road_circuit_02_n.rpk",
+  "target": "0008000000000001_0_REPLACE_WITH_EXACT_MESH_INFO_NAME",
+  "translation": [0, 0, 0]
+}
