@@ -15,12 +15,21 @@ from mathutils import Matrix
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input', help='optional local glTF/GLB; imported into this disposable Blender process')
     parser.add_argument('--objects', nargs='+', required=True, help='exact mesh object names; road only')
     parser.add_argument('--output', required=True)
     args = parser.parse_args(sys.argv[sys.argv.index('--') + 1:])
     output = Path(args.output).resolve()
     if output.exists():
         raise RuntimeError('output already exists')
+    if args.input:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from gltf_dependencies import inspect
+        dependencies = inspect(args.input)
+        print(f'Validated {len(dependencies)} glTF buffer/image dependencies')
+        bpy.ops.object.select_all(action='SELECT')
+        bpy.ops.object.delete(use_global=False)
+        bpy.ops.import_scene.gltf(filepath=str(Path(args.input).resolve()))
     objects = [bpy.data.objects.get(name) for name in args.objects]
     if any(obj is None or obj.type != 'MESH' for obj in objects):
         raise RuntimeError('every named object must exist and be a mesh')
@@ -31,9 +40,9 @@ def main():
         # Bake evaluated modifiers and the complete world transform into vertex data.
         evaluated = obj.evaluated_get(graph)
         mesh = bpy.data.meshes.new_from_object(evaluated, depsgraph=graph)
-        mesh.transform(obj.matrix_world)
+        mesh.transform(evaluated.matrix_world)
         # Reflections invert orientation; compensate so normals/winding remain consistent.
-        if obj.matrix_world.determinant() < 0:
+        if evaluated.matrix_world.determinant() < 0:
             mesh.flip_normals()
         mesh.materials.clear()
         for face in mesh.polygons:

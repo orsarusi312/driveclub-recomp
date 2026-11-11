@@ -1,0 +1,15 @@
+{
+  "schema": "dc-external-track-2",
+  "id": "flat_loop",
+  "units": "metres",
+  "axes": "RH_Y_UP",
+  "surfaces": {"asphalt": {"friction": 1.0}},
+  "tiles": [
+    {"id": "road_visible", "role": "visual", "mesh": "road.glb", "origin": [0, 0, 0]},
+    {"id": "road_contact", "role": "collision", "mesh": "road.glb", "surface": "asphalt", "origin": [0, 0, 0]}
+  ],
+  "spawns": [
+    {"id": "grid_0", "kind": "grid", "position": [0, 0.75, -25], "heading_degrees": 90},
+    {"id": "recovery_0", "kind": "respawn", "position": [10, 0.75, -25], "heading_degrees": 90}
+  ]
+}
