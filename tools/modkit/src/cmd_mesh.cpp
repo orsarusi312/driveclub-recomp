@@ -248,6 +248,33 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
         row.Set("uv_decoded", s.uv_off >= 0); row.Set("skinned", s.skin != 0);
         row.Set("position_buffer", HexId(s.pos)); row.Set("attribute_buffer", HexId(s.attr));
         row.Set("index_buffer", HexId(s.ib)); row.Set("position_half_float", s.half);
+        // Measured mesh-local vertices, NOT decoded native draw/culling bounds.
+        std::array<double, 3> low{INFINITY, INFINITY, INFINITY}, high{-INFINITY, -INFINITY, -INFINITY};
+        bool finite = true, exportable = true;
+        const Bytes& positions = pack.Find(s.pos)->data;
+        for (uint32_t vertex = s.lo; vertex <= s.hi; ++vertex) {
+            for (size_t axis = 0; axis < 3; ++axis) {
+                const uint8_t* value = &positions[28 + size_t(vertex) * s.pos_stride + axis * (s.half ? 2 : 4)];
+                float decoded;
+                if (s.half) decoded = HalfToFloat(Rd16(value));
+                else std::memcpy(&decoded, value, 4);
+                finite &= std::isfinite(decoded);
+                exportable &= std::isfinite(decoded) && std::fabs(decoded) < 1e6f;
+                low[axis] = std::min(low[axis], double(decoded));
+                high[axis] = std::max(high[axis], double(decoded));
+            }
+        }
+        Json bounds;
+        if (finite) {
+            bounds = Json::Array();
+            Json lo = Json::Array(), hi = Json::Array();
+            for (size_t axis = 0; axis < 3; ++axis) { lo.Push(low[axis]); hi.Push(high[axis]); }
+            bounds.Push(lo); bounds.Push(hi);
+        }
+        row.Set("vertex_bounds", bounds);
+        row.Set("bounds_space", "mesh-local vertices; native scene transform and culling bounds unknown");
+        if (!finite) blockers.Push("nonfinite_donor_positions");
+        else if (!exportable) blockers.Push("donor_positions_exceed_legacy_export_range");
         const RpkResource& mesh = *pack.Find(s.mesh);
         std::string reason = "no_attribute_stream_with_matching_vertex_count";
         for (uint64_t id : mesh.deps) {

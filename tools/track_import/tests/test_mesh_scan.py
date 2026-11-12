@@ -33,6 +33,19 @@ class MeshScanTests(unittest.TestCase):
         self.assertEqual(a['triangles'],1); self.assertTrue(a['normal_decoded']); self.assertFalse(a['tangent_decoded'])
         self.assertEqual(a['shared_buffer_slots'],[b['target']]); self.assertTrue(a['independent_buffer_mentions'])
         self.assertEqual(a['shared_index_buffer_slots'],[b['target']])
+        self.assertEqual(a['vertex_bounds'], [[0,0,0], [11,0,1]])
+
+    def test_nonfinite_and_unexportable_donor_positions(self):
+        record=next(r for r in self.doc['resources'] if r['id']=='0003000000000001')
+        path=self.root/'unpacked'/record['file']; original=path.read_bytes()
+        for value,reason in [(float('nan'),'nonfinite_donor_positions'),
+                             (float('inf'),'nonfinite_donor_positions'),
+                             (1000000.0,'donor_positions_exceed_legacy_export_range')]:
+            with self.subTest(value=value):
+                data=bytearray(original); struct.pack_into('<f',data,28,value); path.write_bytes(data)
+                report=self.scan(); self.assertFalse(report['candidates'])
+                self.assertIn(reason,report['slots'][0]['blockers'])
+                if reason=='nonfinite_donor_positions': self.assertIsNone(report['slots'][0]['vertex_bounds'])
     def test_normal_evidence(self):
         cases=[(22,14,'normal_semantic_present_but_type_unsupported'),
                (21,1,'no_normal_semantic_in_selected_descriptor'),

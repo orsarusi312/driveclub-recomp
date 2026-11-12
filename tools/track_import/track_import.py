@@ -267,8 +267,8 @@ def stage(config, bridge_path, dcmod, output):
     target = bridge['target']
     require(isinstance(target, str) and re.fullmatch(r'[0-9a-fA-F]{16}_[0-9]+_.+', target), 'use full exact dcmod mesh info target name')
     offset = vector(bridge.get('translation', [0, 0, 0]), 3, 'translation')
-    road = dict(road, positions=[[p[k] + offset[k] for k in range(3)] for p in road['positions']])
-    require(max(abs(x) for p in road['positions'] for x in p) < 65000, 'translation exceeds half-float range')
+    placement_mode = bridge.get('placement', 'explicit')
+    require(placement_mode in ('explicit', 'donor_bounds_center'), 'placement: expected explicit or donor_bounds_center')
     output = Path(output).resolve()
     require(not output.exists(), 'output already exists; choose a new staging folder')
     require(not template.is_relative_to(output), 'output contains template')
@@ -297,6 +297,25 @@ def stage(config, bridge_path, dcmod, output):
     require(not blockers, target + ': ' + ', '.join(blockers) +
             '; inspect dcmod mesh scan PACK (vertex_streams includes format IDs and raw field kind/type/index); '
             'candidate slots: ' + ', '.join(compatibility['candidates'][:3]))
+    donor_bounds = selected.get('vertex_bounds')
+    require(isinstance(donor_bounds, list) and len(donor_bounds) == 2,
+            'scanner lacks donor vertex bounds; rebuild dcmod')
+    donor_bounds = [vector(row, 3, 'donor vertex bounds') for row in donor_bounds]
+    source_bounds = report['bounds']
+    if placement_mode == 'donor_bounds_center':
+        offset = [offset[k] + (donor_bounds[0][k] + donor_bounds[1][k] -
+                              source_bounds[0][k] - source_bounds[1][k]) / 2 for k in range(3)]
+    road = dict(road, positions=[[p[k] + offset[k] for k in range(3)] for p in road['positions']])
+    require(max(abs(x) for p in road['positions'] for x in p) < 65000, 'translation exceeds half-float range')
+    placed_bounds = [[source_bounds[side][k] + offset[k] for k in range(3)] for side in range(2)]
+    extends = any(placed_bounds[0][k] < donor_bounds[0][k] or placed_bounds[1][k] > donor_bounds[1][k] for k in range(3))
+    placement_warnings = ['native scene transform and culling bounds are unknown; materials remain inherited']
+    if extends:
+        placement_warnings.append('replacement extends outside donor vertex bounds; inspect placement and possible culling')
+    report['placement'] = {'mode': placement_mode, 'space': 'mesh_local', 'donor_vertex_bounds': donor_bounds,
+                           'source_bounds': source_bounds, 'replacement_bounds': placed_bounds,
+                           'applied_translation': offset, 'extends_donor_vertex_bounds': extends,
+                           'warnings': placement_warnings}
     # Export the exact slot to prove the name is present before the legacy importer is called.
     with tempfile.TemporaryDirectory(prefix='dc-road-') as tmp:
         tmp = Path(tmp)
@@ -339,6 +358,7 @@ def stage(config, bridge_path, dcmod, output):
             target_path = pending / 'files' / game_path
             target_path.parent.mkdir(parents=True)
             shutil.copyfile(tmp / 'visual.rpk', target_path)
+            shutil.copyfile(tmp / 'verify.glb', pending / 'placement-preview.glb')
             (pending / 'mod.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
             (pending / 'import-report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
             output.mkdir()

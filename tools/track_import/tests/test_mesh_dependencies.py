@@ -195,6 +195,21 @@ class MeshDependencyTests(unittest.TestCase):
             self.cli('mesh', 'export', pack, '--dependency', self.dep, '-o', self.root/(name+'.glb'),
                      '0008000000000001_1_road_slot')
         self.assertEqual((self.root/'before.glb').read_bytes(), (self.root/'after.glb').read_bytes())
+        # Controlled translation in the existing mesh-local frame, no guessed scene transform.
+        spec.update(placement='donor_bounds_center', translation=[1,0.25,2])
+        bridge.write_text(json.dumps(spec)); output = self.root/'centered'
+        result = stage(); self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads((output/'import-report.json').read_text())
+        placement = report['placement']
+        self.assertEqual(placement['applied_translation'], [6.5,0.25,2.5])
+        self.assertTrue(placement['extends_donor_vertex_bounds'])
+        self.assertEqual(placement['replacement_bounds'], [[-43.5,0.25,-27.5],[56.5,0.25,32.5]])
+        self.assertTrue((output/'placement-preview.glb').is_file())
+        output = self.root/'invalid-placement'
+        spec['placement'] = 'world_transform'; bridge.write_text(json.dumps(spec))
+        result = stage(); self.assertNotEqual(result.returncode, 0)
+        self.assertIn('placement:', result.stderr); self.assertFalse(output.exists())
+        spec['placement'] = 'explicit'
         output = self.root/'rejected'
         for dependencies in ('global.rpk', [None], ['missing.rpk'], ['@global.rpk']):
             spec['dependencies'] = dependencies; bridge.write_text(json.dumps(spec))

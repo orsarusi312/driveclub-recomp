@@ -135,7 +135,8 @@ $Bridge = @{
     dependencies = @($Global, $Common)
     game_path = 'worlds/canada_road_circuit_02_n.rpk'
     target = $Candidate
-    translation = @(0,0,0)
+    placement = 'donor_bounds_center'
+    translation = @(0,0.2,0)
 }
 [IO.File]::WriteAllText("$Work\bridge.json", ($Bridge | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
 py -3 tools/track_import/track_import.py stage tools/track_import/assets/flat_loop/track.json --bridge "$Work\bridge.json" --dcmod $DC -o "$Work\staged"
@@ -146,17 +147,105 @@ foreach ($Path in $Inputs) {
 Get-Content "$Work\staged\import-report.json"
 ```
 
-Translation is in the inherited mesh-local frame, not a verified world frame.
-Zero is only a controlled initial experiment. Materials, scene transform,
-visibility, culling, native collision and vehicle position remain inherited.
-No bounds or scene records are guessed or rewritten.
+The example centers the replacement's vertex bounds on the donor's vertex
+bounds and adds 0.2 native units on local Y. This is a controlled placement
+experiment, not a verified road height or world transform. Use `placement =
+'explicit'` and your own `translation` to retain the original translation-only
+behavior. Neither mode rotates, rescales or rewrites native scene/culling bounds.
+`import-report.json` records both bounds, the applied translation and warnings
+when the replacement extends beyond donor vertices. `placement-preview.glb` is
+the re-exported replacement after native quantization; import it alongside
+`candidate-preview.glb` in Blender to compare placement. It contains the
+replacement geometry only. Materials, scene transform, visibility, collision
+and vehicle position remain inherited. Vertex bounds are not engine culling
+bounds, and containment does not establish visibility.
 
-For the baseline/override game experiment use the isolated run procedure in
-[external-track-runtime-probe.md](external-track-runtime-probe.md), pointing its
-staged `files` source to `$Work\staged\files`. Build the diagnostic game with
-`BB_DIAGNOSTICS=ON bash build.sh` in MSYS2 CLANG64. Keep baseline and override
-runs in separate new folders with private `--user`, `--mods`, GPU cache and logs;
-never copy into the dump or original save folder. Keep both run directories and compare the override log against the stock baseline.
+## Isolated baseline and visual-override runs
+
+These commands reuse `$Work`, `$Base` and `$Update` above. Build the diagnostic
+runtime; unlike dcmod this needs the Windows dependencies in BUILDING.md:
+
+```powershell
+& C:\msys64\usr\bin\bash.exe -lc 'cd /h/DC-Track-Test && BB_DIAGNOSTICS=ON bash build.sh'
+Assert-Native
+```
+
+Set `$Installed` to your working Recomp installation (read-only DLL source),
+and `$Prep` to its existing prepared game files. They cannot be inferred from
+the donor RPK path. The test executable/DLLs, profiles, mods and logs all go
+under the new `$Work` folder. No original executable or save is replaced.
+
+```powershell
+$Installed = 'H:\YOUR-WORKING-RECOMP-INSTALL'
+$Prep = 'H:\YOUR-WORKING-RECOMP-INSTALL\data\prep'
+foreach ($Name in @('boot-linked.bin','content.bin','patches.bin')) {
+    if (!(Test-Path -LiteralPath "$Prep\$Name" -PathType Leaf)) { throw "Missing prepared file: $Name" }
+}
+New-Item -ItemType Directory "$Work\runtime" | Out-Null
+Copy-Item .\out\DriveClubGame.diagnostics.exe "$Work\runtime\DriveClubGame.diagnostics.exe"
+Get-ChildItem -LiteralPath $Installed -Filter '*.dll' -File |
+    Copy-Item -Destination "$Work\runtime"
+$Runtime = "$Work\runtime\DriveClubGame.diagnostics.exe"
+git rev-parse HEAD | Set-Content "$Work\commit.txt"
+Get-FileHash $Runtime -Algorithm SHA256 | Format-List | Out-File "$Work\runtime-sha256.txt"
+
+function Invoke-VisualTrial([string]$Name, [bool]$UseOverride) {
+    $Run = "$Work\$Name"
+    if (Test-Path -LiteralPath $Run) { throw 'Choose a new run directory' }
+    New-Item -ItemType Directory "$Run\user", "$Run\mods", "$Run\logs" | Out-Null
+    if ($UseOverride) { Copy-Item -Recurse "$Work\staged\files\*" "$Run\mods\" }
+    if (Test-Path .\packaging\release\trophies.tsv) { Copy-Item .\packaging\release\trophies.tsv $Run }
+    $Names = @('BB_TRACK_PROBE','BB_BENCHMARK','BB_BENCHMARK_OUT','BB_GPU_USER_DIR','BB_CRASH_DIR','DRIVECLUB_DATA_DIR')
+    $Saved = @{}
+    foreach ($Key in $Names) { $Saved[$Key] = [Environment]::GetEnvironmentVariable($Key, 'Process') }
+    Push-Location $Run
+    try {
+        $env:BB_TRACK_PROBE = '1'
+        $env:BB_BENCHMARK = 'track=canada_road_circuit_02_n,mode=TimeTrial,drive=none,seconds=120'
+        $env:BB_BENCHMARK_OUT = "$Run\logs\benchmark.txt"
+        $env:BB_GPU_USER_DIR = "$Run\user"
+        $env:BB_CRASH_DIR = "$Run\logs"
+        $env:DRIVECLUB_DATA_DIR = $Run
+        & $Runtime "$Prep\boot-linked.bin" --content-profile "$Prep\content.bin" --patches "$Prep\patches.bin" --app0 $Update --app0-base $Base --user "$Run\user" --mods "$Run\mods" --stub-unresolved --timeout 300 2>&1 | Tee-Object "$Run\runtime.log"
+        $LASTEXITCODE | Set-Content "$Run\exit-code.txt"
+    } finally {
+        Pop-Location
+        foreach ($Key in $Names) { [Environment]::SetEnvironmentVariable($Key, $Saved[$Key], 'Process') }
+    }
+    Select-String -Path "$Run\runtime.log" -Pattern 'TrackProbe:|Benchmark:|Fault:|FFB physics:|replaced by mods'
+}
+Invoke-VisualTrial 'baseline' $false
+# Continue only after the stock donor loads successfully; retain baseline screenshots.
+Invoke-VisualTrial 'override' $true
+```
+
+If Windows reports a missing DLL, use the same runtime dependencies as your
+working installation or MSYS2 CLANG64 build in the isolated runtime folder.
+A baseline startup failure is not evidence of an importer problem. The private
+profile may require initial setup and may not have unlocks. The contact probe
+is observation only and depends on its existing signature-checked FFB hook
+being reached; see [probe limitations](external-track-runtime-probe.md).
+
+During the override run, look for the donor path in `replaced by mods folder`
+messages (logging is capped at 40 replacements). Capture the same viewpoints
+as baseline plus a second viewpoint showing the loop and a stock landmark.
+Record any pop-in/disappearance as the camera moves, material artifacts, or a
+successful override log with no visible geometry. Stock physics staying on the
+old road is expected; this is not a driveable custom track. Exit normally.
+Retain both run folders; removing these new folders reverses the test.
+
+Collect only reports/logs/screenshots, not game archives or executable copies:
+
+```powershell
+New-Item -ItemType Directory "$Work\evidence" | Out-Null
+Copy-Item "$Work\mesh-compatibility-resolved.json", "$Work\polyRoadShape742-resolved.json", "$Work\commit.txt", "$Work\runtime-sha256.txt", "$Work\staged\import-report.json" "$Work\evidence"
+foreach ($Name in @('baseline','override')) {
+    Copy-Item "$Work\$Name\runtime.log" "$Work\evidence\$Name-runtime.log"
+    Copy-Item "$Work\$Name\exit-code.txt" "$Work\evidence\$Name-exit-code.txt"
+}
+# Save your screenshots in $Work\evidence before creating the ZIP.
+Compress-Archive -Path "$Work\evidence\*" -DestinationPath "$Work\visual-evidence.zip"
+```
 
 ## Validation and remaining evidence
 
@@ -204,3 +293,6 @@ the normal dcmod build and all 45 Python tests passed without skips. Two new
 tests include 15 malformed-GLB variants and an unknown-width descriptor that
 would previously have appeared decodable. Final sanitizer coverage is recorded
 in the subsequent validation report.
+
+Final results, confirmed fixes and the feature matrix are recorded in
+[dependency validation](external-track-dependency-validation.md).
