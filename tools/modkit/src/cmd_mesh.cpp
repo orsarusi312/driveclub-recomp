@@ -50,6 +50,11 @@ struct Sub {
     int normal_off = -1, tangent_off = -1;  // normal and tangent (three 10 bit signed numbers in 4 bytes) in a vertex of the attribute stream
     int uv_off = -1;  // where the texture coordinate (two floats) sits in a vertex of the attribute stream
     uint32_t stride = 0;
+    uint64_t normal_buffer = 0, uv_buffer = 0, tangent_buffer = 0;
+    uint32_t normal_stride = 0, uv_stride = 0, tangent_stride = 0;
+    std::vector<uint64_t> streams; // explicitly bound non-position vertex streams
+    std::vector<std::string> binding_problems;
+    bool partial_layout = false;
     // skinning: four weights (half floats, kind 7) and four bone numbers (16 bit, kind 8), in the attribute stream or in a stream of their own
     uint64_t skin = 0;
     uint32_t skin_stride = 0;
@@ -111,7 +116,9 @@ long LastMention(const Bytes& d, uint64_t id, size_t at) {
 // gives the size for known encodings; unknown widths are not inferred.
 struct Fields {
     int normal = -1, tangent = -1, uv = -1, weights = -1, joints = -1;
-    bool whole = false;  // the sizes add up to the stride
+    bool whole = false;  // all sizes known and add up to stride
+    bool partial = false; // only the known prefix has decodable offsets
+    uint32_t opaque_at = 0;
 };
 
 Fields ParseFields(const RpkResource* fmt, uint32_t stride) {
@@ -122,7 +129,17 @@ Fields ParseFields(const RpkResource* fmt, uint32_t stride) {
     uint32_t at = 0;
     for (size_t k = 0; k < n && 21 + k * 5 + 5 <= fmt->data.size(); ++k) {
         const uint8_t kind = fmt->data[21 + k * 5], type = fmt->data[22 + k * 5];
-        if (!MeshFieldWidth(type)) return Fields();
+        if (!MeshFieldWidth(type)) {
+            // No offsets are assigned at or beyond this field. A lower bound
+            // rejects impossible suffixes without assuming any unknown width.
+            uint32_t minimum = 0;
+            for (size_t tail = k; tail < n; ++tail)
+                minimum += std::max(1u, MeshFieldWidth(fmt->data[22 + tail * 5]));
+            if (at > stride || minimum > stride - at) return Fields();
+            f.partial = true; f.opaque_at = at;
+            return f;
+        }
+        if (at > stride || MeshFieldWidth(type) > stride - at) return Fields();
         if (kind == 5 && type == 8 && f.uv < 0) f.uv = int(at);
         if (kind == 2 && type == 15 && f.normal < 0) f.normal = int(at);
         if (kind == 5 && type == 15 && fmt->data[23 + k * 5] == 6 && f.tangent < 0) f.tangent = int(at);
@@ -234,7 +251,97 @@ std::vector<Sub> FindSubs(const RpkPack& pack, const MeshFormats& formats) {
             out.push_back(s);
         }
     }
+    // A resource somewhere in the mesh dependency list is not enough evidence
+    // that it belongs to this draw. Use explicit mentions in each record block.
+    for (Sub& s : out) {
+        s.normal_buffer = s.normal_off >= 0 ? s.attr : 0;
+        s.uv_buffer = s.uv_off >= 0 ? s.attr : 0;
+        s.tangent_buffer = s.tangent_off >= 0 ? s.attr : 0;
+        s.normal_stride = s.uv_stride = s.tangent_stride = s.stride;
+        const RpkResource& mesh = *pack.Find(s.mesh);
+        std::vector<uint64_t> active;
+        bool first_record = true;
+        for (size_t rec : s.recs) {
+            size_t begin = 0;
+            for (const Sub& other : out) if (other.mesh == s.mesh)
+                for (size_t previous : other.recs) if (previous < rec) begin = std::max(begin, previous + 18);
+            std::vector<uint64_t> current;
+            for (uint64_t id : mesh.deps) {
+                const RpkResource* vb = pack.Find(id);
+                if (!vb || int(vb->Type()) != vb_type || LastMention(mesh.data, id, rec) < long(begin)) continue;
+                if (id == s.pos) continue;
+                if (PositionKind(*vb) || VbCount(*vb) != VbCount(*pack.Find(s.pos))) {
+                    s.binding_problems.push_back("unmatched_vertex_stream_in_draw_block");
+                    continue;
+                }
+                if (std::find(current.begin(), current.end(), id) == current.end()) current.push_back(id);
+            }
+            std::sort(current.begin(), current.end());
+            if (first_record) active = current;
+            else if (active != current) s.binding_problems.push_back("inconsistent_stream_bindings_across_records");
+            first_record = false;
+        }
+        s.streams = active;
+        // Keep legacy shared-reference export behavior when no explicit block
+        // can be identified; relocation remains blocked by mention validation.
+        std::vector<uint64_t> semantic_streams = active;
+        if (active.empty() && s.attr) semantic_streams.push_back(s.attr);
+        semantic_streams.push_back(s.pos); // normals can share the position record
+
+        s.normal_off = s.uv_off = s.tangent_off = -1;
+        s.normal_buffer = s.uv_buffer = s.tangent_buffer = 0;
+        int normals = 0, uvs = 0, tangents = 0;
+        for (uint64_t id : semantic_streams) {
+            const RpkResource& vb = *pack.Find(id);
+            const uint32_t stride = Rd16(vb.data.data() + 22);
+            const RpkResource* fmt = vb.deps.empty() ? nullptr : formats.Find(vb.deps[0]);
+            const Fields f = ParseFields(fmt, stride);
+            s.partial_layout |= f.partial;
+            if (id != s.pos && !f.whole && !f.partial) s.binding_problems.push_back("bound_attribute_layout_unresolved_or_invalid");
+            if (f.normal >= 0) { ++normals; s.normal_buffer = id; s.normal_stride = stride; s.normal_off = f.normal; }
+            if (f.uv >= 0) { ++uvs; s.uv_buffer = id; s.uv_stride = stride; s.uv_off = f.uv; }
+            if (f.tangent >= 0) { ++tangents; s.tangent_buffer = id; s.tangent_stride = stride; s.tangent_off = f.tangent; }
+            // Even an opaque encoding cannot hide a declared skin stream from
+            // the static-geometry candidate gate.
+            if (fmt && MeshFormatProblem(fmt).empty())
+                for (size_t k = 0; k < fmt->data[20]; ++k)
+                    if (fmt->data[21 + k*5] == 7 || fmt->data[21 + k*5] == 8) s.skin = s.skin ? s.skin : id;
+        }
+        if (normals > 1) { s.normal_off = -1; s.normal_buffer = 0; s.binding_problems.push_back("ambiguous_normal_streams"); }
+        if (uvs > 1) { s.uv_off = -1; s.uv_buffer = 0; s.binding_problems.push_back("ambiguous_uv_streams"); }
+        if (tangents > 1) { s.tangent_off = -1; s.tangent_buffer = 0; s.binding_problems.push_back("ambiguous_tangent_streams"); }
+    }
     return out;
+}
+
+std::vector<uint64_t> RelocationStreams(const Sub& s) {
+    std::vector<uint64_t> ids = s.streams;
+    ids.push_back(s.pos);
+    if (s.streams.empty() && s.attr) ids.push_back(s.attr);
+    if (s.skin) ids.push_back(s.skin);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+bool IndependentMentions(const RpkPack& pack, const Sub& s, const std::vector<Sub>& all) {
+    const Bytes& data = pack.Find(s.mesh)->data;
+    for (size_t rec : s.recs) {
+        size_t begin = 0;
+        for (const Sub& other : all) if (other.mesh == s.mesh)
+            for (size_t previous : other.recs) if (previous < rec) begin = std::max(begin, previous + 18);
+        for (uint64_t id : RelocationStreams(s)) {
+            const long at = LastMention(data, id, rec);
+            if (at < long(begin)) return false;
+            for (const Sub& other : all) {
+                if (&other == &s || other.mesh != s.mesh) continue;
+                const auto used = RelocationStreams(other);
+                if (std::find(used.begin(), used.end(), id) == used.end()) continue;
+                for (size_t r : other.recs) if (LastMention(data, id, r) == at) return false;
+            }
+        }
+    }
+    return true;
 }
 
 // Reports the same slot interpretation used by ImportSub; never mutates a pack.
@@ -244,6 +351,11 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
     for (const Sub& s : subs) {
         Json row = Json::Object(), blockers = Json::Array(), warnings = Json::Array(), streams = Json::Array();
         row.Set("target", s.name); row.Set("vertices", s.vertices()); row.Set("triangles", s.count / 3);
+        row.Set("normal_buffer", HexId(s.normal_buffer)); row.Set("uv_buffer", HexId(s.uv_buffer));
+        row.Set("tangent_buffer", HexId(s.tangent_buffer)); row.Set("partial_layout", s.partial_layout);
+        Json bound = Json::Array(); for (uint64_t id : RelocationStreams(s)) bound.Push(HexId(id));
+        row.Set("relocation_buffers", bound);
+        for (const auto& problem : s.binding_problems) blockers.Push(problem);
         row.Set("normal_decoded", s.normal_off >= 0); row.Set("tangent_decoded", s.tangent_off >= 0);
         row.Set("uv_decoded", s.uv_off >= 0); row.Set("skinned", s.skin != 0);
         row.Set("position_buffer", HexId(s.pos)); row.Set("attribute_buffer", HexId(s.attr));
@@ -282,6 +394,16 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
             if (!vb || vb->Type() != unsigned(RpkTypeFromName("vertex_buffer"))) continue;
             Json stream = Json::Object(), fields = Json::Array();
             stream.Set("id", HexId(id)); stream.Set("selected_attributes", id == s.attr);
+            stream.Set("selected_normal", id == s.normal_buffer); stream.Set("selected_uv", id == s.uv_buffer);
+            stream.Set("selected_tangent", id == s.tangent_buffer);
+            const Fields decoded = ParseFields(vb->deps.empty() ? nullptr : formats.Find(vb->deps[0]), Rd16(vb->data.data()+22));
+            stream.Set("known_prefix_decodable", decoded.partial);
+            stream.Set("normal_offset", decoded.normal); stream.Set("uv_offset", decoded.uv);
+            stream.Set("tangent_offset", decoded.tangent);
+            if (decoded.partial) {
+                stream.Set("opaque_suffix_offset", decoded.opaque_at);
+                stream.Set("opaque_suffix_bytes", uint32_t(Rd16(vb->data.data()+22)) - decoded.opaque_at);
+            }
             stream.Set("vertices", VbCount(*vb)); stream.Set("stride", Rd16(vb->data.data()+22));
             const RpkResource* fmt = vb->deps.empty() ? nullptr : formats.Find(vb->deps[0]);
             stream.Set("format_id", vb->deps.empty() ? "" : HexId(vb->deps[0]));
@@ -312,22 +434,22 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
             }
             streams.Push(stream);
         }
+        if (s.normal_buffer && s.normal_off >= 0) reason = s.partial_layout ? "decoded_known_prefix" : "decoded";
+        if (std::find(s.binding_problems.begin(), s.binding_problems.end(), "ambiguous_normal_streams") != s.binding_problems.end()) reason = "ambiguous_normal_streams";
         row.Set("normal_status", reason); row.Set("vertex_streams", streams);
         if (s.normal_off < 0) blockers.Push(reason);
         if (s.uv_off < 0) blockers.Push("no_decoded_uv_for_flat_loop");
         if (s.skin) blockers.Push("skinned_slot_not_a_static_geometry_candidate");
-        size_t previous=0;
         Json shares=Json::Array(), index_shares=Json::Array();
+        const auto used = RelocationStreams(s);
         for (const Sub& other:subs) {
-            if (&other != &s && (other.pos==s.pos || (s.attr && other.attr==s.attr))) shares.Push(other.name);
+            const auto theirs = RelocationStreams(other);
+            bool shared = false;
+            for (uint64_t id : used) shared |= std::find(theirs.begin(), theirs.end(), id) != theirs.end();
+            if (&other != &s && shared) shares.Push(other.name);
             if (&other != &s && other.ib==s.ib) index_shares.Push(other.name);
-            if (other.mesh==s.mesh) for (size_t at:other.recs)
-                if (at<s.recs.front()) previous=std::max(previous,at+18);
         }
-        bool independent = s.attr != 0;
-        for (size_t at:s.recs) {
-            independent &= LastMention(mesh.data,s.pos,at)>=long(previous) && LastMention(mesh.data,s.attr,at)>=long(previous);
-        }
+        const bool independent = s.attr != 0 && IndependentMentions(pack, s, subs);
         row.Set("shared_buffer_slots", shares); row.Set("shared_index_buffer_slots", index_shares);
         row.Set("independent_buffer_mentions", independent);
         if (!independent) blockers.Push("buffer_mentions_missing_or_shared_with_previous_slot");
@@ -335,6 +457,7 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
         bool has_draw=std::search(mesh.data.begin(),mesh.data.end(),draw.begin(),draw.end())!=mesh.data.end();
         row.Set("draw_table_found",has_draw);
         if (!has_draw) blockers.Push("draw_table_entry_not_found");
+        if (s.partial_layout) warnings.Push("unknown_suffix_not_decoded_full_donor_rows_preserved_shader_semantics_unverified");
         if (s.tangent_off<0) warnings.Push("tangent_not_decoded_material_compatibility_unverified");
         warnings.Push("scene_transform_culling_visibility_and_materials_unverified");
         warnings.Push("classification_is_for_supported_flat_loop_format_not_runtime_success");
@@ -414,10 +537,10 @@ Bytes MakeGlb(const RpkPack& pack, const std::vector<Sub>& subs) {
         if (has_uv) {
             PadTo4(bin, 0);
             uv_at = bin.size();
-            const Bytes& av = pack.Find(s.attr)->data;
+            const Bytes& av = pack.Find(s.uv_buffer)->data;
             for (uint32_t i = s.lo; i <= s.hi; ++i) {
                 float uv[2];
-                std::memcpy(uv, &av[28 + size_t(i) * s.stride + size_t(s.uv_off)], 8);
+                std::memcpy(uv, &av[28 + size_t(i) * s.uv_stride + size_t(s.uv_off)], 8);
                 uv[1] = 1.f - uv[1];
                 for (float f : uv) {
                     uint32_t u;
@@ -428,13 +551,13 @@ Bytes MakeGlb(const RpkPack& pack, const std::vector<Sub>& subs) {
             }
         }
         size_t nrm_at = 0;
-        const bool has_nrm = s.normal_off >= 0 && s.attr;
+        const bool has_nrm = s.normal_off >= 0 && s.normal_buffer;
         if (has_nrm) {
             PadTo4(bin, 0);
             nrm_at = bin.size();
-            const Bytes& av = pack.Find(s.attr)->data;
+            const Bytes& av = pack.Find(s.normal_buffer)->data;
             for (uint32_t i = s.lo; i <= s.hi; ++i) {
-                for (float f : Dec10(Rd32(&av[28 + size_t(i) * s.stride + size_t(s.normal_off)]))) {
+                for (float f : Dec10(Rd32(&av[28 + size_t(i) * s.normal_stride + size_t(s.normal_off)]))) {
                     uint32_t u;
                     std::memcpy(&u, &f, 4);
                     Put32(bin, u);
@@ -668,6 +791,21 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
                 throw Error(name + ": invalid triangle index");
         }
     }
+    const auto stream_ids = RelocationStreams(sub);
+    const bool extra_stream = std::any_of(sub.streams.begin(), sub.streams.end(), [&](uint64_t id) { return id != sub.attr && id != sub.skin; });
+    if (!isolate_buffers && ((sub.normal_off >= 0 && sub.normal_buffer != sub.attr) ||
+                            (sub.uv_off >= 0 && sub.uv_buffer != sub.attr) ||
+                            (sub.tangent_off >= 0 && sub.tangent_buffer != sub.attr) || extra_stream || sub.partial_layout))
+        throw Error(name + ": multi-stream or partial-layout import requires --isolate-buffers");
+    if (isolate_buffers) {
+        if (sub.normal_off < 0)
+            throw Error(name + ": isolated imports require a decoded normal stream; run mesh scan with the same --dependency files");
+        if (!sub.binding_problems.empty()) throw Error(name + ": " + sub.binding_problems.front());
+        if (sub.skin && (sub.w_off < 0 || sub.j_off < 0)) throw Error(name + ": skin layout is not decoded");
+        if (!IndependentMentions(pack, sub, all)) throw Error(name + ": buffer mentions are missing or shared with another slot");
+        for (uint64_t id : stream_ids)
+            if (VbCount(*pack.Find(id)) != VbCount(*pack.Find(sub.pos))) throw Error(name + ": stream vertex counts do not match");
+    }
     std::vector<double> uvs;
     if (sub.uv_off >= 0 && prim.Find("attributes")->Has("TEXCOORD_0")) {
         uvs = Accessor(g, GlbUnsigned(*prim.Find("attributes"), "TEXCOORD_0"), 2);
@@ -744,7 +882,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
             }
         }
     }
-    const auto put_frame = [&](uint8_t* dst, size_t i) {
+    const auto put_frame = [&](uint8_t* dst, uint8_t* tangent_dst, size_t i) {
         if (sub.normal_off < 0) return;
         std::array<float, 3> n{};
         bool set = false;
@@ -756,7 +894,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
             const float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
             const float lo = std::sqrt(old[0] * old[0] + old[1] * old[1] + old[2] * old[2]);
             if (l > 0 && (isolate_buffers || lo == 0 || dot / (l * lo) < 0.9995f)) set = true;
-        } else if (i >= nv) {
+        } else if (i >= nv || isolate_buffers) {
             n = calc_n[i], set = true;
         }
         if (set) {
@@ -770,7 +908,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
                 const float d = (t[0] * n[0] + t[1] * n[1] + t[2] * n[2]) / (len * len);
                 for (size_t c = 0; c < 3; ++c) t[c] -= d * n[c];
                 const uint32_t u = Enc10(t);
-                std::memcpy(dst + sub.tangent_off, &u, 4);
+                std::memcpy(tangent_dst + sub.tangent_off, &u, 4);
             }
         }
     };
@@ -780,12 +918,12 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
         const float now[2] = {float(uvs[i * 2]), 1.f - float(uvs[i * 2 + 1])};
         std::memcpy(old, dst + sub.uv_off, 8);
         old[0] = Clean(old[0]), old[1] = Clean(old[1]);  // a junk value (the export wrote 0 for it) counts as unchanged
-        if (std::fabs(old[0] - now[0]) > 1e-6f * std::max(1.f, std::fabs(old[0])) || std::fabs(old[1] - now[1]) > 1e-6f * std::max(1.f, std::fabs(old[1]))) std::memcpy(dst + sub.uv_off, now, 8);
+        if (isolate_buffers || std::fabs(old[0] - now[0]) > 1e-6f * std::max(1.f, std::fabs(old[0])) || std::fabs(old[1] - now[1]) > 1e-6f * std::max(1.f, std::fabs(old[1]))) std::memcpy(dst + sub.uv_off, now, 8);
     };
     if (!grow) {
         for (uint32_t i = 0; i < nv_new; ++i) {
             put_pos(&vb->data[28 + size_t(sub.lo + i) * sub.pos_stride], i);
-            if (av) put_uv(&av->data[28 + size_t(sub.lo + i) * sub.stride], i), put_frame(&av->data[28 + size_t(sub.lo + i) * sub.stride], i);
+            if (av) put_uv(&av->data[28 + size_t(sub.lo + i) * sub.stride], i), put_frame(&av->data[28 + size_t(sub.lo + i) * sub.stride], &av->data[28 + size_t(sub.lo + i) * sub.stride], i);
             if (sv) put_skin(&sv->data[28 + size_t(sub.lo + i) * sub.skin_stride], i);
             else if (sub.skin && av) put_skin(&av->data[28 + size_t(sub.lo + i) * sub.stride], i);
         }
@@ -795,96 +933,73 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
     // A part may have buffers of its own, so that it does not depend on room in the shared ones: always with --own-buffers,
     // and when the shared buffer is full. --isolate-buffers also relocates parts that do not grow.
     const bool own = grow && av && (own_buffers || isolate_buffers || uint64_t(VbCount(*vb)) + nv_new > 65535);
-    RpkResource* dv = vb;
-    RpkResource* da = av;
-    RpkResource* ds = sv;
+    std::map<uint64_t, uint64_t> destinations;
+    for (uint64_t id : stream_ids) destinations[id] = id;
     if (own) {
-        if (nv_new > 65535) throw Error(name + ": a vertex buffer cannot hold that many vertices (16 bit indices)");
-        const RpkResource* mesh0 = pack.Find(sub.mesh);
-        // the part's mentions of its buffers in the mesh: after the record before it and before its own
-        size_t prev_end = 0;
-        for (const Sub& o : all) {
-            if (o.mesh != sub.mesh) continue;
-            for (const size_t r : o.recs) {
-                if (r < sub.recs.front() && r + 18 > prev_end) prev_end = r + 18;
-            }
+        if (!IndependentMentions(pack, sub, all)) throw Error(name + ": cannot independently rebind every vertex stream");
+        for (uint64_t id : stream_ids) {
+            // Add sequentially so the allocator also checks earlier new IDs.
+            const uint64_t fresh = NewBufferId(pack, id, sub.mesh ^ (uint64_t(sub.k) << 40));
+            RpkResource copy = EmptyBufferLike(*pack.Find(id), fresh);
+            pack.Add(std::move(copy));
+            destinations[id] = fresh;
         }
-        std::vector<std::pair<size_t, int>> spots;  // where the mesh names the buffers (0 position, 1 attributes, 2 skin)
-        for (const size_t rec : sub.recs) {
-            const long a = LastMention(mesh0->data, sub.pos, rec), b = LastMention(mesh0->data, sub.attr, rec);
-            if (a < long(prev_end) || b < long(prev_end)) throw Error(name + ": shares its buffers with the sub mesh before it in the mesh, so it cannot get buffers of its own");
-            spots.push_back({size_t(a), 0});
-            spots.push_back({size_t(b), 1});
-            if (sv) {
-                const long c = LastMention(mesh0->data, sub.skin, rec);
-                if (c < long(prev_end)) throw Error(name + ": shares its buffers with the sub mesh before it in the mesh, so it cannot get buffers of its own");
-                spots.push_back({size_t(c), 2});
-            }
+        RpkResource* mesh = pack.Find(sub.mesh);
+        for (uint64_t id : stream_ids) {
+            // Find all locations before patching, including duplicate records
+            // that may mention the same binding more than once.
+            std::vector<size_t> spots;
+            for (size_t rec : sub.recs) spots.push_back(size_t(LastMention(mesh->data, id, rec)));
+            for (size_t at : spots) for (int byte = 0; byte < 8; ++byte)
+                mesh->data[at + size_t(byte)] = uint8_t(destinations[id] >> (byte * 8));
+            mesh->deps.push_back(destinations[id]);
         }
-        const uint64_t np = NewBufferId(pack, sub.pos, sub.mesh ^ (uint64_t(sub.k) << 40) ^ 1), na = NewBufferId(pack, sub.attr, sub.mesh ^ (uint64_t(sub.k) << 40) ^ 2);
-        RpkResource npv = EmptyBufferLike(*vb, np), nav = EmptyBufferLike(*av, na);
-        const uint64_t ns = sv ? NewBufferId(pack, sub.skin, sub.mesh ^ (uint64_t(sub.k) << 40) ^ 3) : 0;
-        RpkResource nsv;
-        if (sv) nsv = EmptyBufferLike(*sv, ns);
-        pack.Add(std::move(npv));
-        pack.Add(std::move(nav));
-        if (sv) pack.Add(std::move(nsv));
-        vb = pack.Find(sub.pos), av = pack.Find(sub.attr), dv = pack.Find(np), da = pack.Find(na);
-        if (sv) sv = pack.Find(sub.skin), ds = pack.Find(ns);
-        RpkResource* m = pack.Find(sub.mesh);
-        for (const auto& [at, kind] : spots) {
-            const uint64_t id = kind == 2 ? ns : kind ? na : np;
-            for (int i = 0; i < 8; ++i) m->data[at + size_t(i)] = uint8_t(id >> (8 * i));
-        }
-        m->deps.push_back(np);
-        m->deps.push_back(na);
-        if (sv) m->deps.push_back(ns);
     }
+    vb = pack.Find(sub.pos); // vector additions may have invalidated old resource pointers
     const uint32_t base = own ? 0 : VbCount(*vb);
     const uint32_t lo = grow ? base : sub.lo, hi = lo + uint32_t(nv_new) - 1;
     if (grow) {
-        if (sv && VbCount(*sv) != VbCount(*vb)) throw Error(name + ": the weights of this mesh cannot be extended");
-        if (!av || VbCount(*av) != VbCount(*vb)) throw Error(name + ": has more vertices than the game's mesh, and the other vertex data of this mesh cannot be extended");
-        if (uint64_t(base) + nv_new > 65535) throw Error(name + ": the vertex buffer cannot hold that many vertices (16 bit indices); --own-buffers gives the part buffers of its own");
+        if (uint64_t(base) + nv_new > 65535) throw Error(name + ": the vertex buffer is full (16 bit indices)");
+        for (uint64_t id : stream_ids)
+            if (VbCount(*pack.Find(id)) != VbCount(*vb)) throw Error(name + ": cannot extend mismatched vertex streams");
         std::vector<std::array<float, 3>> old_pos(nv);
-        for (uint32_t i = 0; i < nv; ++i) {
-            for (size_t c = 0; c < 3; ++c) {
-                const uint8_t* q = &vb->data[28 + size_t(sub.lo + i) * sub.pos_stride + c * csize];
-                if (sub.half) old_pos[i][c] = HalfToFloat(Rd16(q));
-                else std::memcpy(&old_pos[i][c], q, 4);
-            }
+        for (uint32_t i = 0; i < nv; ++i) for (size_t c = 0; c < 3; ++c) {
+            const uint8_t* q = &vb->data[28 + size_t(sub.lo + i) * sub.pos_stride + c * csize];
+            if (sub.half) old_pos[i][c] = HalfToFloat(Rd16(q));
+            else std::memcpy(&old_pos[i][c], q, 4);
+            if (!std::isfinite(old_pos[i][c])) throw Error(name + ": nonfinite donor position");
         }
         for (size_t j = 0; j < nv_new; ++j) {
             uint32_t best = uint32_t(j);
             if (j >= nv) {
-                float best_d = 1e30f;
+                double best_d = std::numeric_limits<double>::infinity();
                 for (uint32_t i = 0; i < nv; ++i) {
-                    float d = 0;
-                    for (size_t c = 0; c < 3; ++c) d += (old_pos[i][c] - float(p[j * 3 + c])) * (old_pos[i][c] - float(p[j * 3 + c]));
+                    double d = 0;
+                    for (size_t c = 0; c < 3; ++c) { const double delta = old_pos[i][c] - p[j*3+c]; d += delta*delta; }
                     if (d < best_d) best_d = d, best = i;
                 }
             }
-            const size_t pat = 28 + size_t(sub.lo + best) * sub.pos_stride, aat = 28 + size_t(sub.lo + best) * sub.stride;
-            const Bytes prow(vb->data.begin() + long(pat), vb->data.begin() + long(pat + sub.pos_stride));
-            const Bytes arow(av->data.begin() + long(aat), av->data.begin() + long(aat + sub.stride));
-            dv->data.insert(dv->data.end(), prow.begin(), prow.end());
-            da->data.insert(da->data.end(), arow.begin(), arow.end());
-            if (sv) {
-                const size_t kat = 28 + size_t(sub.lo + best) * sub.skin_stride;
-                const Bytes krow(sv->data.begin() + long(kat), sv->data.begin() + long(kat + sub.skin_stride));
-                ds->data.insert(ds->data.end(), krow.begin(), krow.end());
-                put_skin(&ds->data[ds->data.size() - sub.skin_stride], j);
-            } else if (sub.skin) {
-                put_skin(&da->data[da->data.size() - sub.stride], j);
+            // Copy entire stride-sized records, preserving every opaque byte.
+            for (uint64_t id : stream_ids) {
+                const RpkResource* source = pack.Find(id);
+                RpkResource* dest = pack.Find(destinations.at(id));
+                const size_t stride = Rd16(source->data.data() + 22), at = 28 + size_t(sub.lo + best) * stride;
+                Bytes row(source->data.begin() + at, source->data.begin() + at + stride);
+                dest->data.insert(dest->data.end(), row.begin(), row.end());
             }
-            put_pos(&dv->data[dv->data.size() - sub.pos_stride], j);
-            put_uv(&da->data[da->data.size() - sub.stride], j);
-            put_frame(&da->data[da->data.size() - sub.stride], j);
+            const auto row = [&](uint64_t id) -> uint8_t* {
+                if (!id) return nullptr;
+                RpkResource* resource = pack.Find(destinations.at(id));
+                const size_t stride = Rd16(resource->data.data() + 22);
+                return &resource->data[resource->data.size() - stride];
+            };
+            put_pos(row(sub.pos), j);
+            if (sub.uv_off >= 0) put_uv(row(sub.uv_buffer), j);
+            if (sub.normal_off >= 0) put_frame(row(sub.normal_buffer), row(sub.tangent_buffer), j);
+            if (sub.skin) put_skin(row(sub.skin), j);
         }
         const uint32_t total = base + uint32_t(nv_new);
-        std::memcpy(&dv->data[24], &total, 4);
-        std::memcpy(&da->data[24], &total, 4);
-        if (sv) std::memcpy(&ds->data[24], &total, 4);
+        for (const auto& binding : destinations) std::memcpy(&pack.Find(binding.second)->data[24], &total, 4);
     }
     uint32_t first = sub.first, count = sub.count;
     if (prim.Has("indices")) {

@@ -79,7 +79,7 @@ class MeshScanTests(unittest.TestCase):
         mesh=self.root/'unpacked/mesh/road_slot.res'; data=bytearray(mesh.read_bytes())
         # Fixture has header(20), then two (24-byte refs + 18-byte record) groups.
         data[62:78]=bytes(16); mesh.write_bytes(data)
-        r=self.scan(); self.assertTrue(r['slots'][0]['compatible']); self.assertFalse(r['slots'][1]['independent_buffer_mentions'])
+        r=self.scan(); self.assertFalse(r['slots'][0]['compatible']); self.assertFalse(r['slots'][1]['independent_buffer_mentions'])
         struct.pack_into('<I',data,104,9); mesh.write_bytes(data)
         r=self.scan(); self.assertFalse(r['slots'][0]['draw_table_found']); self.assertFalse(r['candidates'])
     def test_refuses_output_argument(self):

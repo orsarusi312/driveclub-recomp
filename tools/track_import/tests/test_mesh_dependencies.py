@@ -93,7 +93,7 @@ class MeshDependencyTests(unittest.TestCase):
 
     def test_unknown_field_width_does_not_guess_four_bytes(self):
         fmt = self.root/'dep-src/stream_format/Unnamed.res'
-        data = bytearray(fmt.read_bytes()); data[27] = 42; fmt.write_bytes(data)
+        data = bytearray(fmt.read_bytes()); data[21:31] = bytes([6,42,0,0,0,2,15,0,0,0]); fmt.write_bytes(data)
         self.build_dep()
         manifest = json.loads((self.root/'target-src/pack.json').read_text())
         record = next(r for r in manifest['resources'] if r['id'] == '0003000000000002')
