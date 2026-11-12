@@ -159,6 +159,12 @@ class MultiStreamTests(unittest.TestCase):
     def test_separate_tangent_buffer_is_rebuilt(self):
         from test_track_import import t
         self.add_stream(0x0003000000000003,0x0002000000000003,[(5,15,6)],4)
+        path=self.resource(0x0003000000000003); data=bytearray(path.read_bytes())
+        for i in range(12): struct.pack_into('<I',data,28+i*4,0x80000000)
+        path.write_bytes(data)
+        path=self.resource(self.pos); data=bytearray(path.read_bytes())
+        for i in range(12): struct.pack_into('<I',data,28+i*16+12,0x40000000 | (511<<10))
+        path.write_bytes(data)
         self.build(); self.assertTrue(self.scan()['slots'][0]['tangent_decoded'])
         t.generate(self.root/'track')
         bridge=self.root/'bridge.json'
@@ -173,7 +179,10 @@ class MultiStreamTests(unittest.TestCase):
         record=next(r for r in doc['resources'] if r['id']==slot['tangent_buffer'])
         data=(self.root/'result'/record['file']).read_bytes()
         # Planar x/z UVs yield a +X tangent, orthogonal to the supplied +Y normals.
-        self.assertEqual(list(struct.unpack('<8I',data[28:])),[511]*8)
+        self.assertEqual(list(struct.unpack('<8I',data[28:])),[0x80000000 | 511]*8)
+        record=next(r for r in doc['resources'] if r['id']==slot['normal_buffer'])
+        data=(self.root/'result'/record['file']).read_bytes()
+        for i in range(8): self.assertEqual(struct.unpack_from('<I',data,28+i*16+12)[0] & 0xC0000000,0x40000000)
 
     def test_isolated_uv_write_replaces_sanitized_nan(self):
         from test_track_import import t
@@ -211,6 +220,36 @@ class MultiStreamTests(unittest.TestCase):
         mesh.write_bytes(data); self.build()
         slots=self.scan()['slots']; self.assertFalse(slots[0]['compatible']); self.assertFalse(slots[1]['compatible'])
         self.assertFalse(slots[0]['independent_buffer_mentions'])
+
+    def test_filtered_scan_keeps_full_sharing_context(self):
+        full=self.scan()
+        report=json.loads(self.cli('mesh','scan',self.pack,'--target','*_0_*','--target','*_0_*').stdout)
+        self.assertEqual(report['scanned_slots'],2); self.assertEqual(report['reported_slots'],1)
+        self.assertEqual(report['slots'],[full['slots'][0]])
+        self.cli('mesh','scan',self.pack,'--target','missing',ok=False)
+        self.cli('mesh','export',self.pack,'--target','*_0_*','-o',self.root/'unexpected.glb',ok=False)
+        self.assertFalse((self.root/'unexpected.glb').exists())
+        mesh=self.resource(0x0008000000000001); data=bytearray(mesh.read_bytes()); data[62:78]=bytes(16)
+        mesh.write_bytes(data); self.build()
+        report=json.loads(self.cli('mesh','scan',self.pack,'--target','*_0_*').stdout)
+        self.assertFalse(report['slots'][0]['independent_buffer_mentions'])
+
+    def test_short_stride_and_unhandled_field_metadata(self):
+        attr=self.resource(self.attr); original=attr.read_bytes()
+        data=bytearray(original); struct.pack_into('<H',data,22,7); attr.write_bytes(data); self.build()
+        self.assertFalse(self.scan()['slots'][0]['compatible'])
+        struct.pack_into('<H',data,22,0); attr.write_bytes(data); self.build()
+        self.cli('mesh','scan',self.pack,ok=False)
+        attr.write_bytes(original)
+        for fmt in (self.attrfmt,self.posfmt):
+            with self.subTest(fmt=fmt):
+                path=self.resource(fmt); before=path.read_bytes(); data=bytearray(before); data[24]=1
+                path.write_bytes(data); self.build()
+                slot=self.scan()['slots'][0]; self.assertFalse(slot['compatible'])
+                stream=next(v for v in slot['vertex_streams'] if v['format_id']==f'{fmt:016x}')
+                self.assertEqual(stream['format_problem'],'attribute_format_field_metadata_unsupported')
+                self.assertEqual(stream['fields'][0]['metadata_byte_3'],1)
+                path.write_bytes(before)
 
 
 if __name__=='__main__': unittest.main()

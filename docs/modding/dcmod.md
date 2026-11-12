@@ -68,7 +68,7 @@ FMOD banks. `info BANK`, `extract BANK -o DIR [NAME]`, `wav BANK NAME -o FILE.wa
 
 ## dcmod mesh
 
-Model geometry as glTF. Repeat `--dependency FILE.rpk` for explicit read-only vertex-format providers on scan/export/import; see [dependency resolution](external-track-dependencies.md). `scan PACK` emits a read-only JSON slot compatibility report and ranked flat-loop candidates; see [mesh scanner](external-track-mesh-scan.md). `info PACK`, `export PACK -o FILE.glb [NAME...]`, `import PACK FILE.glb [--own-buffers|--isolate-buffers] -o OUT.rpk` (a part that grows gets vertex buffers of its own; skinned meshes keep bone numbers and weights), `materials PACK [SUBMESH]` and `material PACK TARGET SOURCE -o OUT` (a part uses another material of its mesh). See [models.md](models.md).
+Model geometry as glTF. Repeat `--dependency FILE.rpk` for explicit read-only vertex-format providers on scan/export/import; see [dependency resolution](external-track-dependencies.md). `scan PACK [--target NAME]` emits a read-only JSON slot compatibility report and ranked flat-loop candidates; see [mesh scanner](external-track-mesh-scan.md). `info PACK`, `export PACK -o FILE.glb [NAME...]`, `import PACK FILE.glb [--own-buffers|--isolate-buffers] -o OUT.rpk` (a part that grows gets vertex buffers of its own; skinned meshes keep bone numbers and weights), `materials PACK [SUBMESH]` and `material PACK TARGET SOURCE -o OUT` (a part uses another material of its mesh). See [models.md](models.md).
 
 ## dcmod shader
 
@@ -98,3 +98,5 @@ Shader replacement. `list DUMPDIR [STAGE]`, `dis FILE.spv [-o OUT]`, `as FILE.sp
 | `build DIR... -o OUT` | Applies the mods in the order given (after requirement and order rules; `--settings FILE` gives the player's choices for mod settings, see [mod-format.md](mod-format.md)) and writes the changed files and `dcmod-report.json` (which mod did what to which file). |
 
 Exit status is 1 when a requirement is missing or mods conflict by declaration; value conflicts and warnings are printed and do not change it.
+
+Multi-stream road decoding and focused Windows rescan commands: [road handoff](external-track-multistream.md).

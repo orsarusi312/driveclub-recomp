@@ -59,6 +59,9 @@ inline std::string MeshFormatProblem(const RpkResource* fmt) {
     if (fmt->PayloadId() != fmt->id) return "attribute_format_header_invalid";
     if (size_t(fmt->data[20]) > (fmt->data.size() - 21) / 5)
         return "attribute_format_descriptor_truncated";
+    for (size_t k = 0; k < fmt->data[20]; ++k)
+        if (fmt->data[24 + k*5] || fmt->data[25 + k*5])
+            return "attribute_format_field_metadata_unsupported";
     return {};
 }
 

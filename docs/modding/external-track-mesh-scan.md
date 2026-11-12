@@ -9,7 +9,7 @@ attribute stream had no **decoded** normal. Export only emits NORMAL when
 `Sub.normal_off >= 0`; the pipeline correctly requires it. The decoder recognizes
 normal kind 2/type 15, tangent kind 5/type 15/index 6 and UV kind 5/type 8.
 It discards all field offsets when its layout sizes do not match buffer stride.
-`FindSubs` chooses a non-position stream with the same vertex count; its format
+At the original scanner milestone, `FindSubs` chose a non-position stream with the same vertex count; its format
 must be a resource available in that pack. Formats in required/common packs are
 not automatically resolved. Explicit `--dependency` support is now available; see
 [dependency resolution and Windows commands](external-track-dependencies.md). Therefore successful position/triangle export does
@@ -156,3 +156,8 @@ Seven new scanner tests cover the scenarios above plus missing attribute buffers
 truncated vertex buffers, shared index-buffer reporting, and staging rejection
 before publication. No normal-decoding requirement was removed. This change
 does not implement native road collision or vehicle spawning.
+
+The current [multi-stream decoder](external-track-multistream.md) additionally
+resolves per-attribute bindings, including normals in position streams, and
+permits bounded known prefixes while retaining opaque suffixes. Refer to that
+guide for current compatibility rules and focused reports.

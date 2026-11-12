@@ -34,6 +34,7 @@ int Usage() {
         "  dcmod mesh import PACK FILE.glb [--own-buffers] -o OUT.rpk  write the pack again with the positions (and triangles) of the\n"
         "                                              glTF objects that came from it\n"
         "  --dependency PACK                          repeat for explicit local read-only stream-format sources\n"
+        "  --target NAME                              scan only: repeatable wildcard filter; all slots still checked\n"
         "  --isolate-buffers                            always relocate imported parts, including smaller ones\n"
         "\n"
         "PACK is a file or @path in the game's archive. Objects are named ID_N_NAME (the mesh's identifier and the\n"
@@ -298,6 +299,8 @@ std::vector<Sub> FindSubs(const RpkPack& pack, const MeshFormats& formats) {
             const Fields f = ParseFields(fmt, stride);
             s.partial_layout |= f.partial;
             if (id != s.pos && !f.whole && !f.partial) s.binding_problems.push_back("bound_attribute_layout_unresolved_or_invalid");
+            if (id == s.pos && fmt && !MeshFormatProblem(fmt).empty())
+                s.binding_problems.push_back("position_format_descriptor_invalid");
             if (f.normal >= 0) { ++normals; s.normal_buffer = id; s.normal_stride = stride; s.normal_off = f.normal; }
             if (f.uv >= 0) { ++uvs; s.uv_buffer = id; s.uv_stride = stride; s.uv_off = f.uv; }
             if (f.tangent >= 0) { ++tangents; s.tangent_buffer = id; s.tangent_stride = stride; s.tangent_off = f.tangent; }
@@ -345,10 +348,14 @@ bool IndependentMentions(const RpkPack& pack, const Sub& s, const std::vector<Su
 }
 
 // Reports the same slot interpretation used by ImportSub; never mutates a pack.
-Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFormats& formats) {
+Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFormats& formats,
+                const std::vector<std::string>& targets) {
     Json report = Json::Object(), slots = Json::Array(), candidates = Json::Array();
     std::vector<const Sub*> ranked;
     for (const Sub& s : subs) {
+        if (!targets.empty() && std::none_of(targets.begin(), targets.end(), [&](const std::string& pattern) {
+                return WildMatch(Lower(pattern), Lower(s.name));
+            })) continue;
         Json row = Json::Object(), blockers = Json::Array(), warnings = Json::Array(), streams = Json::Array();
         row.Set("target", s.name); row.Set("vertices", s.vertices()); row.Set("triangles", s.count / 3);
         row.Set("normal_buffer", HexId(s.normal_buffer)); row.Set("uv_buffer", HexId(s.uv_buffer));
@@ -414,10 +421,12 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
             stream.Set("format_problem", problem);
             bool complete = problem.empty();
             bool declared = false, supported = false, known_widths = true;
-            if (complete) for (size_t k=0; k<fmt->data[20]; ++k) {
+            const bool records_present = fmt && fmt->data.size() >= 21 && size_t(fmt->data[20]) <= (fmt->data.size()-21)/5;
+            if (records_present) for (size_t k=0; k<fmt->data[20]; ++k) {
                 const size_t at=21+k*5;
                 Json f=Json::Object(); f.Set("kind", int(fmt->data[at])); f.Set("type", int(fmt->data[at+1]));
                 f.Set("index", int(fmt->data[at+2]));
+                f.Set("metadata_byte_3", int(fmt->data[at+3])); f.Set("metadata_byte_4", int(fmt->data[at+4]));
                 f.Set("byte_width_supported", MeshFieldWidth(fmt->data[at+1]) != 0); fields.Push(f);
                 known_widths &= MeshFieldWidth(fmt->data[at+1]) != 0;
                 if (fmt->data[at]==2) { declared=true; supported |= fmt->data[at+1]==15; }
@@ -474,6 +483,8 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
         return a->name<b->name;
     });
     for(const Sub* s:ranked) candidates.Push(s->name);
+    if (!targets.empty() && slots.Items().empty()) throw Error("scan target filters matched no recognized slots");
+    report.Set("scanned_slots", subs.size()); report.Set("reported_slots", slots.Items().size());
     Json required=Json::Array(); for(const std::string& name:pack.required) required.Push(name);
     report.Set("required_packs",required);
     report.Set("schema","dc-mesh-compatibility-1"); report.Set("slots",slots); report.Set("candidates",candidates);
@@ -898,7 +909,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
             n = calc_n[i], set = true;
         }
         if (set) {
-            const uint32_t u = Enc10(n);
+            const uint32_t u = (Rd32(dst + sub.normal_off) & 0xC0000000u) | Enc10(n);
             std::memcpy(dst + sub.normal_off, &u, 4);
         }
         if (sub.tangent_off >= 0 && (i >= nv || isolate_buffers) && !uvs.empty()) {
@@ -907,7 +918,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
             if (len > 0) {
                 const float d = (t[0] * n[0] + t[1] * n[1] + t[2] * n[2]) / (len * len);
                 for (size_t c = 0; c < 3; ++c) t[c] -= d * n[c];
-                const uint32_t u = Enc10(t);
+                const uint32_t u = (Rd32(tangent_dst + sub.tangent_off) & 0xC0000000u) | Enc10(t);
                 std::memcpy(tangent_dst + sub.tangent_off, &u, 4);
             }
         }
@@ -1052,7 +1063,8 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
 int RunMesh(const std::vector<std::string>& argv) {
     if (argv.empty()) return Usage();
     const std::string cmd = argv[0];
-    const Args args = ParseArgs(argv, {"--update", "--base", "--game", "-o", "--output", "--dependency"});
+    const Args args = ParseArgs(argv, {"--update", "--base", "--game", "-o", "--output", "--dependency", "--target"});
+    if (args.Has("--target") && cmd != "scan") throw Error("--target is supported only by mesh scan");
     if (args.positional.size() < 2) return Usage();
     RpkPack pack = LoadPack(args, args.positional[1]);
     const auto dependencies = args.All("--dependency");
@@ -1088,7 +1100,7 @@ int RunMesh(const std::vector<std::string>& argv) {
 
     if (cmd == "scan") {
         if (args.Has("-o") || args.Has("--output")) throw Error("scan writes JSON to stdout only; redirect to a new report file");
-        Json report = ScanMeshes(pack, subs, formats);
+        Json report = ScanMeshes(pack, subs, formats, args.All("--target"));
         report.Set("dependency_packs", dependency_report);
         report.Set("resolution_scope", "stream_format IDs only; explicit local files; conflicting payloads/dependencies rejected; no resource merging or recursive loading");
         const std::string json = report.Dump();
