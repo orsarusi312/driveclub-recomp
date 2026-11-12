@@ -9,6 +9,7 @@
 #include "cli.hpp"
 #include "json.hpp"
 #include "rpk.hpp"
+#include "mesh_formats.hpp"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +33,7 @@ int Usage() {
         "                                              or a material identifier)\n"
         "  dcmod mesh import PACK FILE.glb [--own-buffers] -o OUT.rpk  write the pack again with the positions (and triangles) of the\n"
         "                                              glTF objects that came from it\n"
+        "  --dependency PACK                          repeat for explicit local read-only stream-format sources\n"
         "  --isolate-buffers                            always relocate imported parts, including smaller ones\n"
         "\n"
         "PACK is a file or @path in the game's archive. Objects are named ID_N_NAME (the mesh's identifier and the\n"
@@ -113,7 +115,7 @@ struct Fields {
 
 Fields ParseFields(const RpkResource* fmt, uint32_t stride) {
     Fields f;
-    if (!fmt || fmt->data.size() < 21) return f;
+    if (!MeshFormatProblem(fmt).empty()) return f;
     const size_t n = fmt->data[20];
     if (n > (fmt->data.size() - 21) / 5) return f;
     uint32_t at = 0;
@@ -131,7 +133,7 @@ Fields ParseFields(const RpkResource* fmt, uint32_t stride) {
     return f;
 }
 
-std::vector<Sub> FindSubs(const RpkPack& pack) {
+std::vector<Sub> FindSubs(const RpkPack& pack, const MeshFormats& formats) {
     const int vb_type = RpkTypeFromName("vertex_buffer"), ib_type = RpkTypeFromName("index_buffer"), mesh_type = RpkTypeFromName("mesh");
     std::vector<Sub> out;
     for (const RpkResource& m : pack.resources) {
@@ -154,7 +156,7 @@ std::vector<Sub> FindSubs(const RpkPack& pack) {
             const RpkResource* r = pack.Find(d);
             if (!r) continue;
             if (int(r->Type()) == vb_type && r->data.size() >= 28) {
-                const Fields vf = ParseFields(r->deps.empty() ? nullptr : pack.Find(r->deps[0]), Rd16(r->data.data() + 22));
+                const Fields vf = ParseFields(r->deps.empty() ? nullptr : formats.Find(r->deps[0]), Rd16(r->data.data() + 22));
                 if (PositionKind(*r)) poss.push_back(d);
                 else if (vf.weights >= 0 && vf.normal < 0 && vf.uv < 0) skins.push_back(d);  // weights and bones only
                 else attrs.push_back(d);
@@ -205,7 +207,7 @@ std::vector<Sub> FindSubs(const RpkPack& pack) {
                 s.attr = nearest(same, i);
                 const RpkResource* av = pack.Find(s.attr);
                 s.stride = Rd16(av->data.data() + 22);
-                const Fields f = ParseFields(av->deps.empty() ? nullptr : pack.Find(av->deps[0]), s.stride);
+                const Fields f = ParseFields(av->deps.empty() ? nullptr : formats.Find(av->deps[0]), s.stride);
                 s.uv_off = f.uv, s.normal_off = f.normal, s.tangent_off = f.tangent;
                 if (f.weights >= 0 && f.joints >= 0) s.skin = s.attr, s.skin_stride = s.stride, s.w_off = f.weights, s.j_off = f.joints;
             }
@@ -218,7 +220,7 @@ std::vector<Sub> FindSubs(const RpkPack& pack) {
                     s.skin = nearest(same_skin, i);
                     const RpkResource* sv = pack.Find(s.skin);
                     s.skin_stride = Rd16(sv->data.data() + 22);
-                    const Fields f = ParseFields(sv->deps.empty() ? nullptr : pack.Find(sv->deps[0]), s.skin_stride);
+                    const Fields f = ParseFields(sv->deps.empty() ? nullptr : formats.Find(sv->deps[0]), s.skin_stride);
                     if (f.weights >= 0 && f.joints >= 0) s.w_off = f.weights, s.j_off = f.joints;
                     else s.skin = 0;
                 }
@@ -234,7 +236,7 @@ std::vector<Sub> FindSubs(const RpkPack& pack) {
 }
 
 // Reports the same slot interpretation used by ImportSub; never mutates a pack.
-Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs) {
+Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFormats& formats) {
     Json report = Json::Object(), slots = Json::Array(), candidates = Json::Array();
     std::vector<const Sub*> ranked;
     for (const Sub& s : subs) {
@@ -252,9 +254,14 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs) {
             Json stream = Json::Object(), fields = Json::Array();
             stream.Set("id", HexId(id)); stream.Set("selected_attributes", id == s.attr);
             stream.Set("vertices", VbCount(*vb)); stream.Set("stride", Rd16(vb->data.data()+22));
-            const RpkResource* fmt = vb->deps.empty() ? nullptr : pack.Find(vb->deps[0]);
+            const RpkResource* fmt = vb->deps.empty() ? nullptr : formats.Find(vb->deps[0]);
             stream.Set("format_id", vb->deps.empty() ? "" : HexId(vb->deps[0]));
-            bool complete = fmt && fmt->data.size() >= 21 && fmt->data.size() >= 21u + size_t(fmt->data[20])*5;
+            Json sources = Json::Array();
+            if (!vb->deps.empty()) for (const auto& source : formats.Sources(vb->deps[0])) sources.Push(source);
+            stream.Set("format_sources", sources);
+            const std::string problem = MeshFormatProblem(fmt);
+            stream.Set("format_problem", problem);
+            bool complete = problem.empty();
             bool declared = false, supported = false;
             if (complete) for (size_t k=0; k<fmt->data[20]; ++k) {
                 const size_t at=21+k*5;
@@ -265,8 +272,7 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs) {
             stream.Set("format_complete", complete); stream.Set("fields", fields);
             stream.Set("decoder_stride_matches", complete && ParseFields(fmt,Rd16(vb->data.data()+22)).whole);
             if (id == s.attr) {
-                if (!fmt) reason="attribute_format_resource_missing_from_pack";
-                else if (!complete) reason="attribute_format_descriptor_truncated";
+                if (!complete) reason=problem;
                 else if (!declared) reason="no_normal_semantic_in_selected_descriptor";
                 else if (!supported) reason="normal_semantic_present_but_type_unsupported";
                 else if (!ParseFields(fmt,s.stride).whole) reason="normal_present_but_decoded_layout_does_not_match_stride";
@@ -618,6 +624,10 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
     // External geometry must not rewrite vertices shared by another scene part.
     const bool grow = nv_new > nv || isolate_buffers;
     if (isolate_buffers && !av) throw Error(name + ": cannot isolate without an attribute stream");
+    if (isolate_buffers && sub.normal_off < 0)
+        throw Error(name + ": isolated imports require a decoded normal stream; run mesh scan with the same --dependency files");
+    if (isolate_buffers && prim.Find("attributes")->Has("TEXCOORD_0") && sub.uv_off < 0)
+        throw Error(name + ": isolated import cannot preserve UVs; run mesh scan with the same --dependency files");
     // bone numbers and weights from the glTF object (JOINTS_0 and WEIGHTS_0)
     std::vector<double> jn, wt;
     if (sub.skin && prim.Find("attributes")->Has("JOINTS_0") && prim.Find("attributes")->Has("WEIGHTS_0")) {
@@ -871,14 +881,46 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
 int RunMesh(const std::vector<std::string>& argv) {
     if (argv.empty()) return Usage();
     const std::string cmd = argv[0];
-    const Args args = ParseArgs(argv, {"--update", "--base", "--game", "-o", "--output"});
+    const Args args = ParseArgs(argv, {"--update", "--base", "--game", "-o", "--output", "--dependency"});
     if (args.positional.size() < 2) return Usage();
     RpkPack pack = LoadPack(args, args.positional[1]);
-    std::vector<Sub> subs = FindSubs(pack);
+    const auto dependencies = args.All("--dependency");
+    // An output path must never alias the target or any supplied dependency,
+    // including symlinks/hardlinks. No discovery or recursive loading by name.
+    const std::string output = args.Get("-o", args.Get("--output"));
+    const auto protect = [&](const std::string& input) {
+        if (output.empty() || input.empty() || input[0] == '@') return;
+        if (fs::weakly_canonical(output) == fs::weakly_canonical(input) ||
+            (fs::exists(output) && fs::exists(input) && fs::equivalent(output, input)))
+            throw Error("output aliases read-only input: " + input);
+    };
+    protect(args.positional[1]);
+    MeshFormats formats;
+    formats.Add(pack, args.positional[1]);
+    Json dependency_report = Json::Array();
+    for (const auto& path : dependencies) {
+        if (path.empty() || path[0] == '@') throw Error("--dependency needs an explicit local RPK file");
+        protect(path);
+        try {
+            const RpkPack dependency = RpkPack::Parse(ReadFile(path));
+            formats.Add(dependency, path);
+            Json entry = Json::Object(), required = Json::Array();
+            entry.Set("path", path);
+            for (const auto& name : dependency.required) required.Push(name);
+            entry.Set("required_packs", required);
+            dependency_report.Push(entry);
+        } catch (const Error& e) {
+            throw Error("dependency " + path + ": " + e.what());
+        }
+    }
+    std::vector<Sub> subs = FindSubs(pack, formats);
 
     if (cmd == "scan") {
         if (args.Has("-o") || args.Has("--output")) throw Error("scan writes JSON to stdout only; redirect to a new report file");
-        const std::string json = ScanMeshes(pack, subs).Dump();
+        Json report = ScanMeshes(pack, subs, formats);
+        report.Set("dependency_packs", dependency_report);
+        report.Set("resolution_scope", "stream_format IDs only; explicit local files; conflicting payloads/dependencies rejected; no resource merging or recursive loading");
+        const std::string json = report.Dump();
         std::fputs(json.c_str(), stdout);
         return 0;
     }

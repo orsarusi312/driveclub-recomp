@@ -272,7 +272,22 @@ def stage(config, bridge_path, dcmod, output):
     output = Path(output).resolve()
     require(not output.exists(), 'output already exists; choose a new staging folder')
     require(not template.is_relative_to(output), 'output contains template')
-    scan = subprocess.run([str(dcmod), 'mesh', 'scan', str(template)], text=True, capture_output=True)
+    dependency_specs = bridge.get('dependencies', [])
+    require(isinstance(dependency_specs, list) and all(isinstance(p, str) and p and not p.startswith('@') for p in dependency_specs),
+            'dependencies: expected a list of explicit local RPK paths')
+    dependencies = [(bridge_path.parent / p).resolve() for p in dependency_specs]
+    for path in dependencies:
+        require(path.is_file() and path.suffix.lower() == '.rpk', 'dependency: expected local extracted RPK: ' + str(path))
+        require(not path.is_relative_to(output), 'output contains dependency')
+    dependency_args = [arg for path in dependencies for arg in ('--dependency', str(path))]
+    def fingerprint(path):
+        digest = hashlib.sha256()
+        with path.open('rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest()
+    inputs = {path: fingerprint(path) for path in [template, *dependencies]}
+    scan = subprocess.run([str(dcmod), 'mesh', 'scan', str(template), *dependency_args], text=True, capture_output=True)
     require(scan.returncode == 0, 'mesh compatibility scan failed (rebuild dcmod): ' + scan.stderr.strip())
     compatibility = json.loads(scan.stdout)
     selected = next((s for s in compatibility['slots'] if s['target'] == target), None)
@@ -285,7 +300,7 @@ def stage(config, bridge_path, dcmod, output):
     # Export the exact slot to prove the name is present before the legacy importer is called.
     with tempfile.TemporaryDirectory(prefix='dc-road-') as tmp:
         tmp = Path(tmp)
-        run_dcmod(dcmod, 'mesh', 'export', template, '-o', tmp / 'slot.glb', target)
+        run_dcmod(dcmod, 'mesh', 'export', template, '-o', tmp / 'slot.glb', target, *dependency_args)
         data = (tmp / 'slot.glb').read_bytes()
         length = struct.unpack_from('<I', data, 12)[0]
         slot = json.loads(data[20:20+length])
@@ -295,9 +310,9 @@ def stage(config, bridge_path, dcmod, output):
         require(road['uvs'] is None or 'TEXCOORD_0' in slot_attrs, 'target cannot preserve supplied UVs')
         # The existing importer ignores node transforms; write already-baked coordinates.
         (tmp / 'mapped.glb').write_bytes(make_glb(road, target))
-        run_dcmod(dcmod, 'mesh', 'import', template, tmp / 'mapped.glb', '--isolate-buffers', '-o', tmp / 'visual.rpk')
+        run_dcmod(dcmod, 'mesh', 'import', template, tmp / 'mapped.glb', '--isolate-buffers', '-o', tmp / 'visual.rpk', *dependency_args)
         # Read it back through the real exporter, checking that the new geometry survived quantization.
-        run_dcmod(dcmod, 'mesh', 'export', tmp / 'visual.rpk', '-o', tmp / 'verify.glb', target)
+        run_dcmod(dcmod, 'mesh', 'export', tmp / 'visual.rpk', '-o', tmp / 'verify.glb', target, *dependency_args)
         actual = read_glb(tmp / 'verify.glb', max_position=65504)
         require(actual['indices'] == road['indices'], 'RPK triangle round-trip mismatch')
         require(len(actual['positions']) == len(road['positions']), 'RPK vertex count mismatch')
@@ -310,7 +325,11 @@ def stage(config, bridge_path, dcmod, output):
                     'category': 'Track', 'files': 'files', 'description': 'Experimental original mesh replacement. Existing collision, route and spawn are unchanged.'}
         report.update(status='visual slot staged; in-game rendering unverified; NOT a playable new track',
                       game_path=game_path, target=target, translation=offset,
-                      template_sha256=hashlib.sha256(template.read_bytes()).hexdigest())
+                      template_sha256=inputs[template],
+                      dependencies=[{'path': str(path), 'sha256': inputs[path]} for path in dependencies],
+                      slot_compatibility=selected)
+        require(all(fingerprint(path) == digest for path, digest in inputs.items()),
+                'an input RPK changed during staging; output will not be published')
         # Assemble beside the destination so every write succeeds before publication.
         # Claim a new directory (mkdir cannot overwrite an existing directory/symlink)
         # and clean it up if publication fails; never leave a half-written mod.

@@ -11,7 +11,8 @@ normal kind 2/type 15, tangent kind 5/type 15/index 6 and UV kind 5/type 8.
 It discards all field offsets when its layout sizes do not match buffer stride.
 `FindSubs` chooses a non-position stream with the same vertex count; its format
 must be a resource available in that pack. Formats in required/common packs are
-not automatically resolved. Therefore successful position/triangle export does
+not automatically resolved. Explicit `--dependency` support is now available; see
+[dependency resolution and Windows commands](external-track-dependencies.md). Therefore successful position/triangle export does
 not distinguish absent normals from unsupported or unresolved attributes.
 The source evidence is `ParseFields`, `FindSubs`, and `ScanMeshes` in
 [`cmd_mesh.cpp`](../../tools/modkit/src/cmd_mesh.cpp); the mandatory staging
