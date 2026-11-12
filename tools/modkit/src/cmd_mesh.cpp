@@ -98,6 +98,7 @@ uint32_t VbCount(const RpkResource& r) { return r.data.size() >= 28 ? Rd32(r.dat
 
 // The last place before `at` where the mesh data names the resource `id` (its identifier as 8 little endian bytes).
 long LastMention(const Bytes& d, uint64_t id, size_t at) {
+    if (d.size() < 8) return -1;
     uint8_t key[8];
     for (int i = 0; i < 8; ++i) key[i] = uint8_t(id >> (8 * i));
     for (size_t i = std::min(at, d.size() - 8) + 1; i-- > 0;) {
@@ -107,7 +108,7 @@ long LastMention(const Bytes& d, uint64_t id, size_t at) {
 }
 
 // The fields of a vertex stream by its stream format: a count, then five bytes per field (kind, type, index, 0, 0). The type
-// gives the size: 12 for three floats, 8 for two floats or four half floats or four 16 bit numbers, else 4.
+// gives the size for known encodings; unknown widths are not inferred.
 struct Fields {
     int normal = -1, tangent = -1, uv = -1, weights = -1, joints = -1;
     bool whole = false;  // the sizes add up to the stride
@@ -121,12 +122,13 @@ Fields ParseFields(const RpkResource* fmt, uint32_t stride) {
     uint32_t at = 0;
     for (size_t k = 0; k < n && 21 + k * 5 + 5 <= fmt->data.size(); ++k) {
         const uint8_t kind = fmt->data[21 + k * 5], type = fmt->data[22 + k * 5];
+        if (!MeshFieldWidth(type)) return Fields();
         if (kind == 5 && type == 8 && f.uv < 0) f.uv = int(at);
         if (kind == 2 && type == 15 && f.normal < 0) f.normal = int(at);
         if (kind == 5 && type == 15 && fmt->data[23 + k * 5] == 6 && f.tangent < 0) f.tangent = int(at);
         if (kind == 7 && type == 6 && f.weights < 0) f.weights = int(at);
         if (kind == 8 && type == 24 && f.joints < 0) f.joints = int(at);
-        at += type == 9 ? 12 : type == 8 || type == 6 || type == 24 ? 8 : 4;
+        at += MeshFieldWidth(type);
     }
     f.whole = at == stride;
     if (!f.whole) f = Fields();
@@ -183,9 +185,9 @@ std::vector<Sub> FindSubs(const RpkPack& pack, const MeshFormats& formats) {
             const uint64_t pos = nearest(poss, i), ib = nearest(ibs, i);
             const uint32_t nv = VbCount(*pack.Find(pos)), ni = VbCount(*pack.Find(ib));
             if (!cnt || cnt % 3 || hi < lo || hi >= nv || uint64_t(first) + cnt > ni) continue;
-            const uint8_t* ix = &pack.Find(ib)->data[28 + first * 2];
+            const uint8_t* ix = &pack.Find(ib)->data[28 + size_t(first) * 2];
             bool inside = true;  // a record whose indices leave its range is not a sub mesh
-            for (uint32_t t = 0; t < cnt && inside; ++t) inside = Rd16(ix + t * 2) >= lo && Rd16(ix + t * 2) <= hi;
+            for (uint32_t t = 0; t < cnt && inside; ++t) inside = Rd16(ix + size_t(t) * 2) >= lo && Rd16(ix + size_t(t) * 2) <= hi;
             if (!inside) continue;
             const std::array<uint64_t, 5> key{pos, ib, lo, hi, (uint64_t(first) << 32) | cnt};
             const auto dup = std::find(seen.begin(), seen.end(), key);
@@ -262,11 +264,13 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
             const std::string problem = MeshFormatProblem(fmt);
             stream.Set("format_problem", problem);
             bool complete = problem.empty();
-            bool declared = false, supported = false;
+            bool declared = false, supported = false, known_widths = true;
             if (complete) for (size_t k=0; k<fmt->data[20]; ++k) {
                 const size_t at=21+k*5;
                 Json f=Json::Object(); f.Set("kind", int(fmt->data[at])); f.Set("type", int(fmt->data[at+1]));
-                f.Set("index", int(fmt->data[at+2])); fields.Push(f);
+                f.Set("index", int(fmt->data[at+2]));
+                f.Set("byte_width_supported", MeshFieldWidth(fmt->data[at+1]) != 0); fields.Push(f);
+                known_widths &= MeshFieldWidth(fmt->data[at+1]) != 0;
                 if (fmt->data[at]==2) { declared=true; supported |= fmt->data[at+1]==15; }
             }
             stream.Set("format_complete", complete); stream.Set("fields", fields);
@@ -275,6 +279,7 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
                 if (!complete) reason=problem;
                 else if (!declared) reason="no_normal_semantic_in_selected_descriptor";
                 else if (!supported) reason="normal_semantic_present_but_type_unsupported";
+                else if (!known_widths) reason="attribute_format_contains_unsupported_field_type";
                 else if (!ParseFields(fmt,s.stride).whole) reason="normal_present_but_decoded_layout_does_not_match_stride";
                 else reason="decoded";
             }
@@ -437,7 +442,7 @@ Bytes MakeGlb(const RpkPack& pack, const std::vector<Sub>& subs) {
         PadTo4(bin, 0);
         const size_t idx_at = bin.size();
         for (uint32_t i = 0; i < s.count; ++i) {
-            const uint32_t v = Rd16(&iv[28 + (s.first + i) * 2]) - s.lo;
+            const uint32_t v = Rd16(&iv[28 + (size_t(s.first) + i) * 2]) - s.lo;
             bin.push_back(uint8_t(v)), bin.push_back(uint8_t(v >> 8));
         }
         const size_t idx_end = bin.size();
@@ -533,26 +538,50 @@ Glb ReadGlb(const Bytes& d) {
     return g;
 }
 
-// The accessor's data as numbers. Handles float and unsigned integer scalars and VEC3 floats.
-std::vector<double> Accessor(const Glb& g, int64_t index, int comps) {
-    const Json& acc = g.json.Find("accessors")->Items().at(size_t(index));
-    const Json& view = g.json.Find("bufferViews")->Items().at(size_t(acc.GetInt("bufferView")));
-    const size_t base = size_t(view.GetInt("byteOffset") + acc.GetInt("byteOffset")), n = size_t(acc.GetInt("count"));
-    const int ct = int(acc.GetInt("componentType"));
-    const size_t size = ct == 5126 || ct == 5125 ? 4 : ct == 5123 ? 2 : 1;
-    const size_t stride = view.GetInt("byteStride") ? size_t(view.GetInt("byteStride")) : size * size_t(comps);
+// GLB lengths/indices are bounded unsigned integers; never round untrusted JSON.
+size_t GlbUnsigned(const Json& object, const char* key, bool required = true) {
+    const Json* value = object.Find(key);
+    if (!value && !required) return 0;
+    if (!value || !value->IsNumber()) throw Error(std::string("GLB needs numeric ") + key);
+    const double number = value->AsNumber();
+    if (!std::isfinite(number) || number < 0 || number > UINT32_MAX || std::floor(number) != number)
+        throw Error(std::string("invalid GLB unsigned field: ") + key);
+    return size_t(number);
+}
+
+// Accessors must fit their declared view, not merely somewhere in the BIN chunk.
+std::vector<double> Accessor(const Glb& g, size_t index, int comps) {
+    const Json* accessors = g.json.Find("accessors"), *views = g.json.Find("bufferViews");
+    if (!accessors || !views) throw Error("GLB needs accessors and bufferViews");
+    const Json& acc = accessors->Items().at(index);
+    const Json& view = views->Items().at(GlbUnsigned(acc, "bufferView"));
+    const size_t offset = GlbUnsigned(view, "byteOffset", false), length = GlbUnsigned(view, "byteLength");
+    const size_t relative = GlbUnsigned(acc, "byteOffset", false), n = GlbUnsigned(acc, "count");
+    const size_t ct = GlbUnsigned(acc, "componentType");
+    if (ct != 5126 && ct != 5125 && ct != 5123 && ct != 5121) throw Error("unsupported GLB component type");
+    const char* shape = comps == 1 ? "SCALAR" : comps == 2 ? "VEC2" : comps == 3 ? "VEC3" : "VEC4";
+    if (acc.GetString("type") != shape || acc.Has("sparse") || acc.GetBool("normalized"))
+        throw Error("unsupported GLB accessor shape, sparse or normalized encoding");
+    if (GlbUnsigned(view, "buffer") != 0) throw Error("GLB view must use embedded buffer zero");
+    const size_t width = ct == 5126 || ct == 5125 ? 4 : ct == 5123 ? 2 : 1;
+    const size_t element = width * size_t(comps);
+    const size_t stride = view.Has("byteStride") ? GlbUnsigned(view, "byteStride") : element;
+    if (offset > g.bin.size() || length > g.bin.size() - offset || relative > length ||
+        !n || stride < element || stride % width || offset % width || relative % width ||
+        length - relative < element || n - 1 > (length - relative - element) / stride)
+        throw Error("GLB accessor outside its view or misaligned");
+    const size_t base = offset + relative;
     std::vector<double> out;
+    out.reserve(n * size_t(comps));
     for (size_t i = 0; i < n; ++i) {
         for (int c = 0; c < comps; ++c) {
-            const size_t at = base + i * stride + size_t(c) * size;
-            if (at + size > g.bin.size()) throw Error("accessor outside the buffer");
-            const uint8_t* q = &g.bin[at];
+            const uint8_t* q = &g.bin[base + i * stride + size_t(c) * width];
             if (ct == 5126) {
                 float f;
                 std::memcpy(&f, q, 4);
                 out.push_back(f);
             } else {
-                out.push_back(size == 4 ? Rd32(q) : size == 2 ? Rd16(q) : q[0]);
+                out.push_back(width == 4 ? Rd32(q) : width == 2 ? Rd16(q) : q[0]);
             }
         }
     }
@@ -605,7 +634,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
         throw Error(name + ": isolated imports require an indexed triangle list");
     // Check indices before any floating-point-to-integer conversion or buffer edit.
     if (prim.Has("indices")) {
-        const auto indices = Accessor(g, prim.GetInt("indices"), 1);
+        const auto indices = Accessor(g, GlbUnsigned(prim, "indices"), 1);
         if (indices.empty() || indices.size() % 3) throw Error(name + ": indices are not a triangle list");
         for (double index : indices) {
             if (!std::isfinite(index) || index < 0 || std::floor(index) != index || index >= double(nv_new))
@@ -614,7 +643,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
     }
     std::vector<double> uvs;
     if (sub.uv_off >= 0 && prim.Find("attributes")->Has("TEXCOORD_0")) {
-        uvs = Accessor(g, prim.Find("attributes")->GetInt("TEXCOORD_0"), 2);
+        uvs = Accessor(g, GlbUnsigned(*prim.Find("attributes"), "TEXCOORD_0"), 2);
         if (uvs.size() != nv_new * 2) uvs.clear();
     }
     RpkResource* vb = pack.Find(sub.pos);
@@ -631,8 +660,8 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
     // bone numbers and weights from the glTF object (JOINTS_0 and WEIGHTS_0)
     std::vector<double> jn, wt;
     if (sub.skin && prim.Find("attributes")->Has("JOINTS_0") && prim.Find("attributes")->Has("WEIGHTS_0")) {
-        jn = Accessor(g, prim.Find("attributes")->GetInt("JOINTS_0"), 4);
-        wt = Accessor(g, prim.Find("attributes")->GetInt("WEIGHTS_0"), 4);
+        jn = Accessor(g, GlbUnsigned(*prim.Find("attributes"), "JOINTS_0"), 4);
+        wt = Accessor(g, GlbUnsigned(*prim.Find("attributes"), "WEIGHTS_0"), 4);
         if (jn.size() != nv_new * 4 || wt.size() != nv_new * 4) jn.clear(), wt.clear();
     }
     const auto put_skin = [&](uint8_t* row, size_t i) {  // `row` is the vertex in the stream that holds the skin data
@@ -662,12 +691,12 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
     // normals: from the glTF object when it has them, else (for vertices that are new) from its triangles
     std::vector<double> nrm;
     if (sub.normal_off >= 0 && prim.Find("attributes")->Has("NORMAL")) {
-        nrm = Accessor(g, prim.Find("attributes")->GetInt("NORMAL"), 3);
+        nrm = Accessor(g, GlbUnsigned(*prim.Find("attributes"), "NORMAL"), 3);
         if (nrm.size() != nv_new * 3) nrm.clear();
     }
     std::vector<std::array<float, 3>> calc_n(nv_new, std::array<float, 3>{0, 0, 0}), calc_t(nv_new, std::array<float, 3>{0, 0, 0});
     if ((nv_new > nv || isolate_buffers) && prim.Has("indices")) {
-        const std::vector<double> ix = Accessor(g, prim.GetInt("indices"), 1);
+        const std::vector<double> ix = Accessor(g, GlbUnsigned(prim, "indices"), 1);
         for (size_t t = 0; t + 2 < ix.size(); t += 3) {
             size_t v[3];
             for (size_t k = 0; k < 3; ++k) v[k] = size_t(ix[t + k]) < nv_new ? size_t(ix[t + k]) : 0;
@@ -832,7 +861,7 @@ void ImportSub(RpkPack& pack, const Sub& sub, const std::vector<Sub>& all, bool 
     }
     uint32_t first = sub.first, count = sub.count;
     if (prim.Has("indices")) {
-        const std::vector<double> idx = Accessor(g, prim.GetInt("indices"), 1);
+        const std::vector<double> idx = Accessor(g, GlbUnsigned(prim, "indices"), 1);
         if (idx.empty() || idx.size() % 3) throw Error(name + ": the indices are not a triangle list");
         RpkResource* ib = pack.Find(sub.ib);
         Bytes raw;
@@ -1050,8 +1079,13 @@ int RunMesh(const std::vector<std::string>& argv) {
                 if (s.mesh == id && s.k == k) sub = &s;
             }
             if (!sub) continue;
-            const Json& prim = meshes->Items().at(size_t(node.GetInt("mesh"))).Find("primitives")->Items().at(0);
-            const std::vector<double> p = Accessor(g, prim.Find("attributes")->GetInt("POSITION"), 3);
+            const Json* primitives = meshes->Items().at(GlbUnsigned(node, "mesh")).Find("primitives");
+            if (!primitives) throw Error(name + ": GLB mesh needs primitives");
+            if (primitives->Items().size() != 1) throw Error(name + ": GLB import needs exactly one primitive per mesh");
+            const Json& prim = primitives->Items().at(0);
+            if (!prim.Find("attributes") || !prim.Find("attributes")->Has("POSITION"))
+                throw Error(name + ": GLB primitive needs POSITION attributes");
+            const std::vector<double> p = Accessor(g, GlbUnsigned(*prim.Find("attributes"), "POSITION"), 3);
             ImportSub(pack, *sub, subs, args.Has("--own-buffers"), args.Has("--isolate-buffers"), g, prim, p, name);
             ++used;
         }

@@ -179,3 +179,28 @@ smoke/hierarchy/instance/reflection tests passed; native probe tests passed
 under AddressSanitizer/UBSan. Full dcmod sanitizer checks and subsequent
 hardening are recorded separately when completed. Windows runtime and
 proprietary-data tests have not been executed here.
+
+### Decoder/accessor hardening follow-up
+
+Review confirmed that the old field decoder treated every unknown attribute
+encoding as four bytes. It now accepts widths only for implemented types
+6, 8, 9, 15 and 24. `attribute_format_contains_unsupported_field_type` means
+one of the other fields prevents safe offset calculation even if the normal
+itself is type 15. Raw field codes remain available in the report. This may
+reduce candidates formerly accepted through an unsupported width assumption.
+It does not add new encodings.
+
+Direct GLB import now rejects missing primitive/attribute/accessor tables,
+multiple primitives, noninteger or negative accessor fields, unsupported
+component/normalized/sparse encodings, misalignment and view overruns before
+writing output. Previously some missing members could be dereferenced, and
+an accessor could read beyond its declared view into another view in the BIN
+chunk. Index byte arithmetic is promoted before multiplication, and short
+resource mention searches avoid unsigned size underflow. No game ABI changes.
+
+The resolver-only snapshot passed all 43 Python tests with dcmod built under
+AddressSanitizer/UBSan (no sanitizer findings). After the decoder/accessor fixes,
+the normal dcmod build and all 45 Python tests passed without skips. Two new
+tests include 15 malformed-GLB variants and an unknown-width descriptor that
+would previously have appeared decodable. Final sanitizer coverage is recorded
+in the subsequent validation report.

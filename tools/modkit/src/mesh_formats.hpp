@@ -6,6 +6,17 @@
 
 namespace dcmod {
 
+// Only widths used by the implemented attribute decoders are established here.
+// Unknown codes must not silently inherit the packed-normal width.
+inline uint32_t MeshFieldWidth(uint8_t type) {
+    switch (type) {
+        case 9: return 12;
+        case 8: case 6: case 24: return 8;
+        case 15: return 4;
+        default: return 0;
+    }
+}
+
 // Decoder-only catalogue. Never merges resources into the writable target pack.
 // Keep only descriptors so dependency geometry/textures can be released after parsing.
 class MeshFormats {

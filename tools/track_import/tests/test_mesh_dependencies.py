@@ -91,6 +91,47 @@ class MeshDependencyTests(unittest.TestCase):
         slot = self.scan(self.dep)['slots'][0]
         self.assertTrue(slot['compatible']); self.assertTrue(slot['tangent_decoded'])
 
+    def test_unknown_field_width_does_not_guess_four_bytes(self):
+        fmt = self.root/'dep-src/stream_format/Unnamed.res'
+        data = bytearray(fmt.read_bytes()); data[27] = 42; fmt.write_bytes(data)
+        self.build_dep()
+        manifest = json.loads((self.root/'target-src/pack.json').read_text())
+        record = next(r for r in manifest['resources'] if r['id'] == '0003000000000002')
+        attr = self.root/'target-src'/record['file']
+        data = bytearray(attr.read_bytes()); struct.pack_into('<H', data, 22, 8); attr.write_bytes(data)
+        self.cli('rpk', 'build', self.root/'target-src', '-o', self.target)
+        slot = self.scan(self.dep)['slots'][0]
+        self.assertFalse(slot['normal_decoded'])
+        self.assertEqual(slot['normal_status'], 'attribute_format_contains_unsupported_field_type')
+
+    def test_malformed_direct_glb_is_rejected_before_output(self):
+        from test_track_import import mutate_glb
+        glb = self.root/'input.glb'; output = self.root/'invalid.rpk'
+        self.cli('mesh', 'export', self.target, '--dependency', self.dep, '-o', glb)
+        original = glb.read_bytes()
+        mutations = [lambda r: r.pop('accessors'), lambda r: r.pop('bufferViews'),
+                     lambda r: r['meshes'][0].pop('primitives'),
+                     lambda r: r['meshes'][0]['primitives'][0].pop('attributes'),
+                     lambda r: r['meshes'][0]['primitives'][0]['attributes'].pop('POSITION'),
+                     lambda r: r['meshes'][0]['primitives'].append(r['meshes'][0]['primitives'][0]),
+                     lambda r: r['accessors'][0].update(count=1.5),
+                     lambda r: r['accessors'][0].update(byteOffset=-1),
+                     lambda r: r['accessors'][0].update(count=4294967295),
+                     lambda r: r['accessors'][0].update(componentType=5122),
+                     lambda r: r['accessors'][0].update(normalized=True),
+                     lambda r: r['accessors'][0].update(sparse={}),
+                     lambda r: r['bufferViews'][0].update(byteLength=4),
+                     lambda r: r['bufferViews'][0].update(byteStride=4),
+                     lambda r: r['bufferViews'][0].update(buffer=1)]
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index):
+                glb.write_bytes(mutate_glb(original, mutation))
+                result = self.cli('mesh', 'import', self.target, glb, '--dependency', self.dep, '-o', output, ok=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn('AddressSanitizer', result.stderr)
+                self.assertNotIn('runtime error:', result.stderr)
+                self.assertFalse(output.exists())
+
     def test_missing_corrupt_and_malformed_dependency(self):
         missing = self.root/'absent.rpk'
         result = self.cli('mesh', 'scan', self.target, '--dependency', missing, ok=False)
