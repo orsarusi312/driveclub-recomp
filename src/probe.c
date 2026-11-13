@@ -9,6 +9,7 @@
 #include <inttypes.h>
 #include <time.h>
 #include "runtime.h"
+#include "runtime_memory_profile.h"
 #include "../gpu/shim/bbport_diagnostics.h"
 #include "guest_cpu.h"
 #include "gpu/bbgpu.h"
@@ -403,6 +404,8 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
                 (void *)record->ExceptionInformation[1],where,GetCurrentThreadId());
     else
         fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
+    if (record->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2)
+        runtime_memory_diagnose((uintptr_t)record->ExceptionInformation[1]);
     fprintf(stderr,"  uptime %llu s\n",(unsigned long long)(GetTickCount64()-start_tick)/1000ULL);
     {
         MEMORYSTATUSEX memory;
@@ -1653,6 +1656,8 @@ int main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+    if (!dc_memory_profile_check(image,size,runtime_memory_direct_size(),stderr))
+        fail("refusing guest startup with an undersized direct-memory pool");
     if (!cpu_only) env_timelapse_install();
     if (!cpu_only) scene_debug_install();
     if (!cpu_only) apply_upscale_render_size(image, size);

@@ -145,6 +145,10 @@ typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
 static PendingHook pending[64]; static size_t pending_count;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
+/* Opt-in startup request trace. No guest strings or memory contents are read. */
+static int memory_trace_enabled(void) {
+    const char *e=getenv("BB_MEMORY_TRACE"); return e && !strcmp(e,"1");
+}
 /* A refused memory request is logged (the first dozen), so a crash that follows it can be explained. */
 static int32_t mem_fail(int32_t code, int line) {
     static volatile long reported[2048]; /* three per place: the game probes some requests on purpose */
@@ -385,6 +389,90 @@ static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
     while (lo<hi) { size_t mid=(lo+hi)/2; if (vmas[mid].end<=a) lo=mid+1; else hi=mid; }
     return lo;
 }
+/* A fatal exception can interrupt the owner of the memory table. Do not take a
+ * blocking lock, read reallocating arrays without a lock, or dereference the
+ * failing address. Copy only three neighboring records to the stack. Windows'
+ * VirtualQuery below is independent of this table and remains useful if busy. */
+typedef struct {
+    Vma guest[3]; size_t guests;
+#ifdef _WIN32
+    HostRegion host[3]; size_t hosts;
+#endif
+} MemorySnapshot;
+static int memory_snapshot(uintptr_t address, MemorySnapshot *out) {
+    memset(out,0,sizeof(*out));
+    if (exclusive_depth || legacy_mode<0) return 0;
+    const int legacy=legacy_mode;
+    if (legacy) {
+        if (pthread_rwlock_tryrdlock(&legacy_lock)) return 0;
+    } else {
+        if (pthread_mutex_trylock(&rw_mutex)) return 0;
+        uint32_t expected=0;
+        if (!__atomic_compare_exchange_n(&rw_state,&expected,RW_WRITER,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) {
+            pthread_mutex_unlock(&rw_mutex); return 0;
+        }
+    }
+    size_t i=vma_index(address);
+    if (i) --i;
+    for (; i<vma_count && out->guests<3; ++i) out->guest[out->guests++]=vmas[i];
+#ifdef _WIN32
+    i=region_index(address);
+    if (i) --i;
+    for (; i<region_count && out->hosts<3; ++i) out->host[out->hosts++]=regions[i];
+#endif
+    if (legacy) pthread_rwlock_unlock(&legacy_lock);
+    else {
+        __atomic_store_n(&rw_state,0,__ATOMIC_RELEASE);
+        pthread_cond_broadcast(&rw_writer_done);
+        pthread_mutex_unlock(&rw_mutex);
+    }
+    return 1;
+}
+static void memory_diagnose(FILE *out, uintptr_t address) {
+    MemorySnapshot s;
+    fprintf(out,"Memory fault context: address=0x%" PRIxPTR " (ranges are end-exclusive)\n",address);
+    if (!memory_snapshot(address,&s)) {
+        fputs("  guest/host tables unavailable (busy or not initialized); no mapping conclusion\n",out);
+    } else {
+        int found=0;
+        for (size_t i=0;i<s.guests;++i) {
+            const Vma *v=&s.guest[i];
+            int contains=v->start<=address && address<v->end;
+            found|=contains;
+            fprintf(out,"  guest%s [0x%" PRIxPTR ",0x%" PRIxPTR ") kind=%s prot=0x%x type=%d phys=0x%" PRIx64 "\n",
+                    contains ? " containing" : " neighbor",v->start,v->end,
+                    v->kind==KIND_RESERVED ? "reserved" : v->kind==KIND_DIRECT ? "direct" : "flexible",v->prot,v->type,v->phys);
+            if (contains && v->kind!=KIND_RESERVED)
+                fprintf(out,"  backing offset at address=0x%" PRIx64 " (guest VA is not a physical offset)\n",v->phys+(address-v->start));
+        }
+        if (!found) fputs("  guest: address not in a recorded VMA\n",out);
+#ifdef _WIN32
+        for (size_t i=0;i<s.hosts;++i) {
+            const HostRegion *r=&s.host[i];
+            fprintf(out,"  host-view%s [0x%" PRIxPTR ",0x%" PRIxPTR ") %s phys=0x%" PRIx64 "\n",
+                    r->start<=address && address<r->end ? " containing" : " neighbor",
+                    r->start,r->end,r->mapped ? "section" : "placeholder",r->phys);
+        }
+#endif
+    }
+#ifdef _WIN32
+    /* Independent samples, not an atomic snapshot with the tables above. Include
+     * both sides of a boundary and the end of an eight-byte MOV destination. */
+    uintptr_t points[3]={address ? address-1 : address,address,address<=UINTPTR_MAX-7 ? address+7 : address};
+    for (size_t i=0;i<3;++i) {
+        MEMORY_BASIC_INFORMATION m;
+        if (!VirtualQuery((void *)points[i],&m,sizeof(m))) {
+            fprintf(out,"  VirtualQuery(0x%" PRIxPTR ") failed error=%lu\n",points[i],GetLastError());
+            continue;
+        }
+        fprintf(out,"  VirtualQuery(0x%" PRIxPTR "): base=%p size=0x%zx allocation=%p state=0x%lx protect=0x%lx allocation-protect=0x%lx type=0x%lx\n",
+                points[i],m.BaseAddress,(size_t)m.RegionSize,m.AllocationBase,m.State,m.Protect,m.AllocationProtect,m.Type);
+    }
+#else
+    fputs("  native page protection: Windows VirtualQuery unavailable on this platform\n",out);
+#endif
+}
+void runtime_memory_diagnose(uintptr_t address) { memory_diagnose(stderr,address); }
 static int vma_insert(size_t at, Vma v) {
     if (vma_count==vma_capacity) {
         size_t capacity=vma_capacity ? vma_capacity*2 : 256;
@@ -396,6 +484,9 @@ static int vma_insert(size_t at, Vma v) {
     vmas[at]=v; ++vma_count; return 0;
 }
 static void vma_erase(size_t at, size_t n) {
+    /* The first mapping drops an empty range before the VMA array exists.
+     * Even a zero-length memmove must not receive null pointers. */
+    if (!n) return;
     memmove(vmas+at,vmas+at+n,(vma_count-at-n)*sizeof(*vmas)); vma_count-=n;
 }
 static int split_at(uintptr_t a) {
@@ -481,8 +572,9 @@ static int direct_range_allocated(uint64_t phys, uint64_t size) {
     return 1;
 }
 
-static ABI uint64_t direct_size(void) { return POOL_SIZE; }
-static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
+uint64_t runtime_memory_direct_size(void) { return POOL_SIZE; }
+static ABI uint64_t direct_size(void) { return runtime_memory_direct_size(); }
+static int32_t direct_allocate_impl(int64_t low, int64_t high, uint64_t size,
                                   uint64_t alignment, int type, int64_t *out) {
     if (!alignment) alignment = PAGE;
     if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10)
@@ -511,13 +603,30 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
     return 0;
 }
-static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {
+static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
+                                  uint64_t alignment, int type, int64_t *out) {
+    int32_t result=direct_allocate_impl(low,high,size,alignment,type,out);
+    if (memory_trace_enabled())
+        fprintf(stderr,"Memory request: allocate low=0x%" PRIx64 " high=0x%" PRIx64 " size=0x%" PRIx64 " align=0x%" PRIx64 " type=%d result=0x%x physical=0x%" PRIx64 " pool=0x%" PRIx64 "\n",
+                (uint64_t)low,(uint64_t)high,size,alignment,type,(unsigned)result,!result ? (uint64_t)*out : UINT64_MAX,POOL_SIZE);
+    return result;
+}
+static int32_t map_direct_impl(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {
     if (!alignment) alignment=PAGE;
     if (!out || physical < 0 || (uint64_t)physical % PAGE || !size || size % PAGE || !valid_alignment(alignment) ||
         (prot & ~0x37)) return INVALID;
     if (!direct_range_allocated((uint64_t)physical,size)) return INVALID;
     int32_t result=place(out,size,prot,flags,alignment,KIND_DIRECT,block_type((uint64_t)physical),(uint64_t)physical);
     if (!result) ++maps;
+    return result;
+}
+static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {
+    const int trace=memory_trace_enabled();
+    uintptr_t requested=trace && out ? (uintptr_t)*out : 0;
+    int32_t result=map_direct_impl(out,size,prot,flags,physical,alignment);
+    if (trace)
+        fprintf(stderr,"Memory request: direct-map requested=0x%" PRIxPTR " actual=0x%" PRIxPTR " size=0x%" PRIx64 " physical=0x%" PRIx64 " align=0x%" PRIx64 " prot=0x%x flags=0x%x result=0x%x\n",
+                requested,!result ? (uintptr_t)*out : 0,size,(uint64_t)physical,alignment,prot,flags,(unsigned)result);
     return result;
 }
 static ABI int32_t direct_map(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {

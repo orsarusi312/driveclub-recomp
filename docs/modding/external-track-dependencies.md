@@ -175,9 +175,18 @@ and `$Prep` to its existing prepared game files. They cannot be inferred from
 the donor RPK path. The test executable/DLLs, profiles, mods and logs all go
 under the new `$Work` folder. No original executable or save is replaced.
 
+First verify a no-mod/no-benchmark launch using the
+[startup memory retest](../startup-memory-fault.md). Prepared `patches.bin` does
+not carry the launcher's direct-memory environment: the bundled 1440p/4K/8K
+memory patches need `BB_DMEM_MB` of 8056/10056/17056, respectively (5056 with
+no enlarged memory patch). Use the budget belonging to the prepared files,
+not a guess from desktop resolution. The runtime now rejects a known mismatch.
+
 ```powershell
 $Installed = 'H:\YOUR-WORKING-RECOMP-INSTALL'
 $Prep = 'H:\YOUR-WORKING-RECOMP-INSTALL\data\prep'
+$DmemMiB = Read-Host 'Direct-memory budget for these prepared files: 5056, 8056, 10056 or 17056'
+if ($DmemMiB -notin @('5056','8056','10056','17056')) { throw 'Check the prepared memory profile first' }
 foreach ($Name in @('boot-linked.bin','content.bin','patches.bin')) {
     if (!(Test-Path -LiteralPath "$Prep\$Name" -PathType Leaf)) { throw "Missing prepared file: $Name" }
 }
@@ -195,11 +204,14 @@ function Invoke-VisualTrial([string]$Name, [bool]$UseOverride) {
     New-Item -ItemType Directory "$Run\user", "$Run\mods", "$Run\logs" | Out-Null
     if ($UseOverride) { Copy-Item -Recurse "$Work\staged\files\*" "$Run\mods\" }
     if (Test-Path .\packaging\release\trophies.tsv) { Copy-Item .\packaging\release\trophies.tsv $Run }
-    $Names = @('BB_TRACK_PROBE','BB_BENCHMARK','BB_BENCHMARK_OUT','BB_GPU_USER_DIR','BB_CRASH_DIR','DRIVECLUB_DATA_DIR')
+    $Names = @('BB_TRACK_PROBE','BB_BENCHMARK','BB_BENCHMARK_OUT','BB_GPU_USER_DIR','BB_CRASH_DIR','DRIVECLUB_DATA_DIR','BB_DMEM_MB','BB_CONFIG','BB_TOGGLE_FILE')
     $Saved = @{}
     foreach ($Key in $Names) { $Saved[$Key] = [Environment]::GetEnvironmentVariable($Key, 'Process') }
     Push-Location $Run
     try {
+        $env:BB_DMEM_MB = $DmemMiB
+        $env:BB_CONFIG = "$Run\user\driveclub.ini"
+        $env:BB_TOGGLE_FILE = "$Run\user\toggles.txt"
         $env:BB_TRACK_PROBE = '1'
         $env:BB_BENCHMARK = 'track=canada_road_circuit_02_n,mode=TimeTrial,drive=none,seconds=120'
         $env:BB_BENCHMARK_OUT = "$Run\logs\benchmark.txt"

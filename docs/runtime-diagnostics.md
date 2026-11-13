@@ -1,5 +1,12 @@
 # Runtime diagnostics builds
 
+For a direct CLI launch, prepared memory patches must be paired with the
+launcher's `BB_DMEM_MB` budget. The 1440p/4K/8K profiles use 8056/10056/17056 MiB;
+the unconfigured runtime exposes only 5056 MiB. See the
+[startup memory fault report and isolated Windows retest](startup-memory-fault.md)
+for the known `+0x67c2ed` failure, the new preflight check, and read-only mapping
+diagnostics. A diagnostics build does not supply the launcher's environment.
+
 Normal builds exclude capture-trigger polling, shader/buffer dumps, GPU profiling, validation/markers, verbose trace/debug logging and diagnostic-only hot-path timing/counters. Setting their old environment flags does not enable them in a normal executable. Error reports and functional frame/display tracking, mirror feedback, rendering synchronization, the performance overlay and benchmark support remain available.
 
 The opt-in shader quarantine remains functional in ordinary builds: `BB_QUARANTINE=1` retains recent draw/dispatch history, so a device loss can save new suspect compute shaders and load them on the next run. This startup option is cached once rather than querying the environment per command. With quarantine off, only diagnostic builds collect that history.
