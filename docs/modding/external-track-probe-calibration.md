@@ -1,5 +1,10 @@
 # Calibrate the draw probe before interpreting zero donor matches
 
+Follow-up: the user has now validated capture/replay during gameplay on this
+implementation. Road742 still has zero matches. Continue with
+[resource read tracing and bound-buffer search](external-track-resource-trace.md)
+instead of repeating the calibration experiment below.
+
 ## Evidence from the three Windows runs
 
 At `59130353c870a51e6bd43440048495aa49be84ea`, Stock/Control/Marker all launched

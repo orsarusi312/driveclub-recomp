@@ -39,6 +39,15 @@ class MeshScanTests(unittest.TestCase):
         self.assertTrue(a['draw_record_offsets'])
         self.assertTrue(a['mesh_record_offsets'])
         self.assertTrue(a['draw_probe_signature'].startswith('v1:12:12:8:3:0:'))
+        data=(self.root/'input.rpk').read_bytes()
+        spans=a['source_file_spans']
+        self.assertEqual([s['id'] for s in spans],[a['mesh_resource'],a['position_buffer'],a['index_buffer']])
+        for span in spans:
+            offset,size=span['offset'],span['size']
+            self.assertGreaterEqual(size,20)
+            self.assertLessEqual(offset+size,len(data))
+            self.assertEqual(data[offset:offset+8],b'EVOSLITL')
+            self.assertEqual(struct.unpack_from('<Q',data,offset+8)[0],int(span['id'],16))
 
     def test_position_stride_rejected_before_prefix_read(self):
         record=next(r for r in self.doc['resources'] if r['id']=='0003000000000001')

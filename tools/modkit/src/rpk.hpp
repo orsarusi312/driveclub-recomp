@@ -26,6 +26,7 @@ struct RpkResource {
     std::vector<std::string> sources;
     Bytes data;          // the payload exactly as stored, starting with "EVOSLITL"
     uint32_t order = 0;  // where the payload sits among the others; the lowest comes first
+    uint64_t source_offset = 0; // Parse-only file provenance; Write never consumes this value.
 
     unsigned Type() const { return unsigned(id >> 48); }
     uint32_t PayloadVersion() const;  // from the payload's header; 0 when there is none

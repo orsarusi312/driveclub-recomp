@@ -381,6 +381,16 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
         row.Set("uv_decoded", s.uv_off >= 0); row.Set("skinned", s.skin != 0);
         row.Set("position_buffer", HexId(s.pos)); row.Set("attribute_buffer", HexId(s.attr));
         row.Set("index_buffer", HexId(s.ib)); row.Set("position_half_float", s.half);
+        Json spans=Json::Array();
+        for(uint64_t id : {s.mesh,s.pos,s.ib}) {
+            const auto* resource=pack.Find(id);
+            Json span=Json::Object(); span.Set("id",HexId(id));
+            span.Set("type",RpkTypeName(resource->Type()));
+            span.Set("offset",double(resource->source_offset));
+            span.Set("size",double(resource->data.size())); spans.Push(span);
+        }
+        row.Set("source_file_spans",spans);
+        row.Set("source_span_scope","parsed input file only; includes payload headers; not runtime allocation offsets");
         row.Set("vertex_first", s.lo); row.Set("vertex_last", s.hi);
         row.Set("index_first", s.first); row.Set("index_count", s.count);
         row.Set("position_stride", s.pos_stride);

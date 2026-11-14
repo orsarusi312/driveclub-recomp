@@ -1,5 +1,6 @@
 #include "../../../shim/bbport_diagnostics.h"
 #include "../../../shim/bbport_mesh_probe.h"
+#include "../../../shim/bbport_mesh_search.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -1360,7 +1361,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         scheduler.PopPendingOperations();
     }
     const auto& regs = Regs();
-    if constexpr (BB_DIAGNOSTICS) BbMeshProbe::Begin(is_indexed,regs.num_indices);
+    if constexpr (BB_DIAGNOSTICS) {
+        BbMeshProbe::Begin(is_indexed,regs.num_indices);
+        BbMeshSearch::Begin(false);
+    }
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
     // target is that frame.
     const bool display_draw =
@@ -1634,6 +1638,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         BbRecent::Draw(vs_info.pgm_hash, recent_ps ? recent_ps->pgm_hash : 0, num_indices, num_instances);
         if constexpr (BB_DIAGNOSTICS)
             BbMeshProbe::Recorded(vs_info.pgm_hash,recent_ps ? recent_ps->pgm_hash : 0,num_indices,num_instances);
+        if constexpr (BB_DIAGNOSTICS)
+            BbMeshSearch::Recorded(vs_info.pgm_hash,recent_ps ? recent_ps->pgm_hash : 0,num_indices,0,0,0,0,is_indexed);
     }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
@@ -1946,7 +1952,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     const IndirectDraw& indirect) {
-    if constexpr (BB_DIAGNOSTICS) BbMeshProbe::Begin(false,0,true);
+    if constexpr (BB_DIAGNOSTICS) {
+        BbMeshProbe::Begin(false,0,true);
+        BbMeshSearch::Begin(true);
+    }
     buffer_cache.ApplyQueuedStores(); // bbport: guest stores emulated before this work
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
@@ -2029,6 +2038,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             cmdbuf.drawIndirect(args, args_offset, max_count, stride);
         }
     });
+    if constexpr (BB_DIAGNOSTICS) {
+        const auto* ps=pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        BbMeshSearch::Recorded(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
+            ps ? ps->pgm_hash : 0,0,indirect.args,stride,max_count,count_address,is_indexed);
+    }
     DebugState.IncDrawCall();
 
     ResetBindings(false);
@@ -2662,9 +2676,11 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                     attribute.format==vk::Format::eR32G32B32A32Sfloat ? 12u :
                     attribute.format==vk::Format::eR16G16B16Sfloat ||
                     attribute.format==vk::Format::eR16G16B16A16Sfloat ? 6u : 0u;
-                BbMeshProbe::Observe({buffer.base_address,buffer.GetSize(),buffer.GetStride(),offsets.first,
+                const BbMeshProbe::Binding observed{buffer.base_address,buffer.GetSize(),buffer.GetStride(),offsets.first,
                     width,u32(attribute.format),attribute.location,attribute.offset,
-                    bindings[i].inputRate==vk::VertexInputRate::eVertex});
+                    bindings[i].inputRate==vk::VertexInputRate::eVertex};
+                BbMeshProbe::Observe(observed);
+                BbMeshSearch::Observe(observed);
             }
         }
     }

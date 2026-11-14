@@ -182,6 +182,7 @@ RpkPack RpkPack::Parse(const Bytes& file) {
         res.id = r.U64();
         spans[i].size = r.U32();
         spans[i].offset = r.U32();
+        res.source_offset = spans[i].offset;
         const uint16_t nd = r.U16();
         for (uint16_t k = 0; k < nd; ++k) res.deps.push_back(r.U64());
         const uint16_t nn = r.U16();

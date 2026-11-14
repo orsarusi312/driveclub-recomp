@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
+#include "runtime_rpk_trace.h"
 #ifdef _WIN32
 #include <windows.h>
 /* 64-bit sizes and times; directories are never opened as CRT descriptors. */
@@ -494,8 +495,11 @@ static void touch_for_write(void *buffer,uint64_t size) {
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    const int trace=BB_DIAGNOSTICS && rpk_trace_watches(files[fd].path);
+    const int64_t trace_offset=trace ? host_lseek(h,0,SEEK_CUR) : -1;
     touch_for_write(buffer,size);
     ssize_t n=host_read(h,buffer,size);
+    if (trace) rpk_trace_note(files[fd].path,trace_offset,(uintptr_t)buffer,n,"read-observed-offset");
     { static unsigned dat_reads; if (n>=0 && !strncmp(files[fd].path,"/app0/game",10) && (dat_reads++<60 || dat_reads%2000==0))
         printf("Runtime: read %s size %llu -> %lld (#%u)\n",files[fd].path,(unsigned long long)size,(long long)n,dat_reads); }
     if (n==0 && size>0 && !strncmp(files[fd].path,"/app0/game",10)) {
@@ -517,6 +521,7 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     if (h<0) return -EBADF;
     touch_for_write(buffer,size);
     ssize_t n=pread(h,buffer,size,offset);
+    if (BB_DIAGNOSTICS) rpk_trace_note(files[fd].path,offset,(uintptr_t)buffer,n,"pread");
     { static unsigned dat_reads; if (n>=0 && !strncmp(files[fd].path,"/app0/game",10) && (dat_reads++<60 || dat_reads%2000==0))
         printf("Runtime: pread %s @%lld size %llu -> %lld (#%u)\n",files[fd].path,(long long)offset,(unsigned long long)size,(long long)n,dat_reads); }
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
