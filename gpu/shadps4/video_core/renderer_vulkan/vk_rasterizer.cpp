@@ -1360,11 +1360,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         scheduler.PopPendingOperations();
     }
     const auto& regs = Regs();
-    if constexpr (BB_DIAGNOSTICS) {
-        const u32 width=regs.index_buffer_type.index_type==AmdGpu::IndexType::Index16 ? 2u : 4u;
-        BbMeshProbe::Begin(is_indexed,regs.num_indices,
-            regs.index_base_address.Address<VAddr>()+u64(index_offset)*width,width);
-    }
+    if constexpr (BB_DIAGNOSTICS) BbMeshProbe::Begin(is_indexed,regs.num_indices);
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
     // target is that frame.
     const bool display_draw =
@@ -1950,7 +1946,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     const IndirectDraw& indirect) {
-    if constexpr (BB_DIAGNOSTICS) BbMeshProbe::Begin(false,0,0,0,true);
+    if constexpr (BB_DIAGNOSTICS) BbMeshProbe::Begin(false,0,true);
     buffer_cache.ApplyQueuedStores(); // bbport: guest stores emulated before this work
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
@@ -2657,8 +2653,19 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     if constexpr (BB_DIAGNOSTICS) {
         if (BbMeshProbe::Configuration().enabled) {
             const auto offsets=GetDrawOffsets(regs,pipeline->GetStage(Shader::SwStage::Vertex),fetch);
-            for(const auto& buffer:guest_buffers)
-                BbMeshProbe::Observe(buffer.base_address,buffer.GetSize(),buffer.GetStride(),offsets.first);
+            // Use the same format, offset and rate as the prepared/live Vulkan
+            // inputs. Float-shaped attributes are not assumed to be positions.
+            for(size_t i=0;i<guest_buffers.size() && i<attributes.size() && i<bindings.size();++i) {
+                const auto& buffer=guest_buffers[i];
+                const auto& attribute=attributes[i];
+                const u32 width=attribute.format==vk::Format::eR32G32B32Sfloat ||
+                    attribute.format==vk::Format::eR32G32B32A32Sfloat ? 12u :
+                    attribute.format==vk::Format::eR16G16B16Sfloat ||
+                    attribute.format==vk::Format::eR16G16B16A16Sfloat ? 6u : 0u;
+                BbMeshProbe::Observe({buffer.base_address,buffer.GetSize(),buffer.GetStride(),offsets.first,
+                    width,u32(attribute.format),attribute.location,attribute.offset,
+                    bindings[i].inputRate==vk::VertexInputRate::eVertex});
+            }
         }
     }
     if (motion_draw && !guest_buffers.empty()) {
@@ -2786,6 +2793,8 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     index_bind = {buffer->Handle(), offset, index_type};
+    if constexpr (BB_DIAGNOSTICS)
+        BbMeshProbe::IndexBound(index_address,index_size,regs.index_base_address.Address<VAddr>(),index_offset);
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {

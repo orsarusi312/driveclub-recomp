@@ -1,5 +1,10 @@
 # Donor-local marker and draw recording experiment
 
+**Next diagnostic step:** the three Windows runs at `5913035` found no index
+matches, including stock. Use the [probe calibration experiment](external-track-probe-calibration.md)
+before interpreting those zeros. It adds actual-draw capture/later replay and
+progressive counters; its descriptions supersede the original probe counters below.
+
 ## Current evidence
 
 Windows testing has confirmed that `BB_DMEM_MB=8056` fixes the reported startup
