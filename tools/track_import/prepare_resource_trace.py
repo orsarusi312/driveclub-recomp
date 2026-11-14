@@ -45,6 +45,24 @@ def manifest(row, source, relative):
                 if offset < prior['offset'] + prior['size'] and prior['offset'] < offset + length:
                     raise ValueError('overlapping spans')
             lines.append(f'{rid} {offset} {length}')
+        if 'draw_probe_signature' in row:
+            fields = row['draw_probe_signature'].split(':')
+            if len(fields) != 8 or fields[0] != 'v1':
+                raise ValueError('invalid position signature')
+            stride, width, samples, _, first = map(int, fields[1:6])
+            prefix = bytes.fromhex(fields[6])
+            offset = 28 + first * stride
+            position = next(s for s in spans if s['id'] == row['position_buffer'])
+            if (width not in (6, 12) or not width <= stride <= 4096 or not 3 <= samples <= 8
+                    or len(prefix) != width * samples or first < 0
+                    or offset + (samples-1)*stride + width > position['size']):
+                raise ValueError('position signature outside source span')
+            for i in range(samples):
+                stream.seek(position['offset'] + offset + i*stride)
+                if stream.read(width) != prefix[i*width:(i+1)*width]:
+                    raise ValueError('position signature does not match source bytes')
+            lines[0] = 'rpk-trace-v2'
+            lines.append(f"prefix {position['id']} {offset} {stride} {width} {samples} {prefix.hex()}")
     text = '\n'.join(lines) + '\n'
     if len(text.encode('ascii')) >= 4096:
         raise ValueError('trace manifest too long')
@@ -64,6 +82,10 @@ def prepare(dcmod, source, dependencies, target, relative, output):
         raise ValueError('target must select exactly one slot by full name')
     row = scan['slots'][0]
     text = manifest(row, source, relative)
+    target_spec = row['mesh_search_target']
+    expected = f"t1:{row['position_buffer']}:{row['position_resource_vertices']}:{row['vertices']}"
+    if target_spec != expected or not re.fullmatch(r't1:[0-9a-f]{16}:[0-9]+:[0-9]+', target_spec):
+        raise ValueError('invalid search target metadata')
     # No import, export or RPK rewrite. An existing output is always an error.
     output.mkdir(parents=True, exist_ok=False)
     copy = output / 'mods' / relative
@@ -73,8 +95,10 @@ def prepare(dcmod, source, dependencies, target, relative, output):
         raise ValueError('source changed during preparation or copy differs; do not launch')
     (output / 'rpk-trace.txt').write_bytes(text.encode('ascii'))
     (output / 'stock-probe.txt').write_text(row['draw_probe_signature'] + '\n', encoding='ascii')
+    (output / 'mesh-search-target.txt').write_text(target_spec + '\n', encoding='ascii')
     (output / 'mesh-scan.json').write_text(json.dumps(scan, indent=2) + '\n', encoding='utf-8')
     report = dict(source_sha256=before, copy_sha256=before, relative=relative, target=target,
+                  mesh_search_target=target_spec,
                   scope='byte-identical stock loose-file baseline; no modified geometry',
                   position_prefix_file_offset=next(s['offset'] for s in row['source_file_spans']
                                                   if s['id'] == row['position_buffer'])

@@ -394,6 +394,8 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
         row.Set("vertex_first", s.lo); row.Set("vertex_last", s.hi);
         row.Set("index_first", s.first); row.Set("index_count", s.count);
         row.Set("position_stride", s.pos_stride);
+        row.Set("position_resource_vertices",VbCount(*pack.Find(s.pos)));
+        row.Set("mesh_search_target","t1:"+HexId(s.pos)+":"+std::to_string(VbCount(*pack.Find(s.pos)))+":"+std::to_string(s.vertices()));
         Json records=Json::Array(); for (size_t at:s.recs) records.Push(double(at));
         row.Set("mesh_record_offsets", records);
         // Measured mesh-local vertices, NOT decoded native draw/culling bounds.

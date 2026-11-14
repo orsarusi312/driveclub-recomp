@@ -3,8 +3,13 @@
 #include <assert.h>
 #include <unistd.h>
 static unsigned reads;
+static int prefix_mode;
 int runtime_memory_read_backing(uintptr_t address,void *out,uint64_t size) {
     ++reads;
+    if(size==12 && address>=0x101c && address<=0x1034) {
+        if(prefix_mode==2) return 0;
+        memset(out,prefix_mode ? 0x22:0x11,12); return 1;
+    }
     assert(address==0x1000 && size==20);
     unsigned char header[20]="EVOSLITL"; header[8]=1; header[14]=3;
     memcpy(out,header,20); return 1;
@@ -46,5 +51,21 @@ int main(void) {
     for(unsigned i=0;i<100;++i) rpk_trace_note(c.path,128,0x1000,64,"pread");
     assert(reads<=64); before=reads;
     rpk_trace_note(c.path,128,0x1000,64,"pread"); assert(reads==before);
+    char v2[400]="rpk-trace-v2\n/app0/test.rpk\n0003000000000001 128 64\nprefix 0003000000000001 28 12 12 3 ";
+    for(unsigned i=0;i<36;++i) strcat(v2,"11");
+    strcat(v2,"\n");
+    RpkTraceConfig c2={0}; assert(parse(v2,&c2));
+    uintptr_t prefix_address;
+    const uint64_t id=UINT64_C(0x0003000000000001);
+    assert(!strcmp(rpk_trace_check_prefix(&c2.prefix,id,0,64,0x1000,&prefix_address),"verified") && prefix_address==0x101c);
+    before=reads;
+    assert(!strcmp(rpk_trace_check_prefix(&c2.prefix,id,0,63,0x1000,&prefix_address),"not-covered") && reads==before);
+    assert(!strcmp(rpk_trace_check_prefix(&c2.prefix,id,29,64,0x1000,&prefix_address),"not-covered") && reads==before);
+    prefix_mode=1; assert(!strcmp(rpk_trace_check_prefix(&c2.prefix,id,0,64,0x1000,&prefix_address),"MISMATCH"));
+    prefix_mode=2; assert(!strcmp(rpk_trace_check_prefix(&c2.prefix,id,0,64,0x1000,&prefix_address),"unreadable"));
+    char malformed[400]; strcpy(malformed,v2);
+    char *offset=strstr(malformed," 28 "); assert(offset); offset[1]='9'; offset[2]='9';
+    assert(!parse(malformed,&c2));
+    strcpy(malformed,v2); malformed[strlen(malformed)-2]='z'; assert(!parse(malformed,&c2));
     remove(path); puts("RPK trace: parse, overlap, overflow, split reads, build gate and log/read cap passed");
 }

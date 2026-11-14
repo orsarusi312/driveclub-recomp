@@ -1,10 +1,60 @@
 // Bounded donor-byte search in actual vertex bindings, independent of draw counts.
 #pragma once
 #include "bbport_mesh_probe.h"
+#include <charconv>
 namespace BbMeshSearch {
 using namespace BbMeshProbe;
 constexpr uint64_t ByteBudget=64ull*1024*1024, BindingLimit=2ull*1024*1024;
+constexpr uint64_t AnchorBudget=2ull*1024*1024;
+struct Target { uint64_t resource=0; uint32_t native_vertices=0, slot_vertices=0; bool requested=false, valid=false; };
+inline bool ParseTarget(std::string_view text,Target& out) {
+    if(text.size()>100 || text.substr(0,3)!="t1:") return false;
+    text.remove_prefix(3); Target t;
+    auto number=[&](auto& value,int base,bool last) {
+        const size_t end=last ? text.size():text.find(':');
+        if(end==std::string_view::npos || !end) return false;
+        const auto r=std::from_chars(text.data(),text.data()+end,value,base);
+        if(r.ec!=std::errc{} || r.ptr!=text.data()+end) return false;
+        text.remove_prefix(end+(last ? 0:1)); return true;
+    };
+    if(!number(t.resource,16,false) || !number(t.native_vertices,10,false) || !number(t.slot_vertices,10,true) ||
+       t.resource>>48!=3 || !t.slot_vertices || t.slot_vertices>t.native_vertices || t.native_vertices>10000000) return false;
+    t.requested=t.valid=true; out=t; return true;
+}
+inline const Target& Targeting() {
+    static const Target t=[] { Target value; if(const char* p=BB_DIAGNOSTIC_ENV("BB_MESH_SEARCH_TARGET")) {
+        value.requested=true;
+        if(!ParseTarget(p,value)) std::fputs("MeshSearch: invalid target; search disabled (no broad fallback)\n",stderr);
+    } return value; }(); return t;
+}
+inline uint64_t Vertices(const Binding& b) {
+    if(!b.stride || b.offset>b.size || b.size-b.offset<b.width) return 0;
+    return (b.size-b.offset-b.width)/b.stride+1;
+}
+inline bool Shape(const Target& t,const Binding& b) {
+    const uint64_t n=Vertices(b);
+    return n==t.native_vertices || n==t.slot_vertices;
+}
 struct Result { bool found=false, truncated=false; uint64_t vertex=0, bytes=0, failures=0; };
+// Cheap independent pool: native offset and isolated/repacked start, never numeric tolerance.
+inline Result Anchors(const Spec& spec,const Binding& b,uint64_t budget,Read read) {
+    Result r; std::array<unsigned char,12> row{};
+    if(!b.per_vertex || b.width!=spec.width || b.stride<b.width || b.stride>4096) return r;
+    for(uint32_t first : {spec.first,0u}) {
+        if(first==0 && spec.first==0 && r.bytes) break;
+        if(Vertices(b)<uint64_t(first)+spec.samples) continue;
+        bool match=true;
+        for(uint32_t i=0;i<spec.samples;++i) {
+            if(spec.width>budget-r.bytes) { r.truncated=true; return r; }
+            r.bytes+=spec.width;
+            Gate gate=ReadVertex(b,int64_t(first)+i,row.data(),read);
+            if(gate!=Gate::Match) { if(gate==Gate::Read) ++r.failures; match=false; break; }
+            if(std::memcmp(row.data(),spec.positions.data()+i*spec.width,spec.width)) { match=false; break; }
+        }
+        if(match) { r.found=true; r.vertex=first; return r; }
+    }
+    return r;
+}
 inline Result Find(const Spec& spec,const Binding& b,uint64_t budget,Read read) {
     Result result;
     if(!b.per_vertex || b.width!=spec.width || b.stride<b.width || b.stride>4096 ||
@@ -17,8 +67,9 @@ inline Result Find(const Spec& spec,const Binding& b,uint64_t budget,Read read) 
     const uint64_t batch=(block.size()-overlap)/b.stride+1;
     const uint64_t cap=std::min(budget,BindingLimit);
     for(uint64_t first=0;first<candidates;) {
-        const uint64_t n=std::min(batch,candidates-first), bytes=(n-1)*b.stride+overlap;
-        if(bytes>cap-result.bytes) { result.truncated=true; break; }
+        if(cap-result.bytes<overlap) { result.truncated=true; break; }
+        const uint64_t n=std::min({batch,candidates-first,(cap-result.bytes-overlap)/b.stride+1});
+        const uint64_t bytes=(n-1)*b.stride+overlap;
         result.bytes+=bytes;
         if(!read(b.address+b.offset+first*b.stride,block.data(),bytes)) ++result.failures;
         else for(uint64_t j=0;j<n;++j) {
@@ -47,14 +98,16 @@ inline unsigned Referenced(const Spec& spec,const Binding& b,uint64_t vertex,con
     }
     return count;
 }
-struct Entry { Binding binding; Result result; };
+struct Entry { Binding binding; Result result; bool reported=false; };
 struct SearchState {
-    std::array<Entry,1024> cache{};
-    std::array<uint16_t,2048> lookup{}; // index+1, bounded open addressing, at most half full
+    std::array<Entry,4096> cache{};
+    std::array<uint16_t,8192> lookup{}; // index+1, bounded open addressing, at most half full
     std::array<Entry,32> hits{};
-    unsigned used=0, hit_count=0, supported=0, logs=0, checks=0;
+    std::array<Entry*,8> candidates{};
+    unsigned used=0, hit_count=0, candidate_count=0, candidate_logs=0, supported=0, logs=0, checks=0;
     uint64_t bytes=0, failures=0, truncated=0, unsupported=0, skips=0, full=0,
-             direct=0, indirect=0, found=0, referenced=0, stale=0, no_supported_bindings=0;
+             direct=0, indirect=0, found=0, referenced=0, stale=0, no_supported_bindings=0,
+             anchor_bytes=0, anchor_hits=0, shape_candidates=0, shape_skipped=0, scan_complete=0, budget_skipped=0;
     bool armed=false, indirect_draw=false, budget_reported=false;
     std::chrono::steady_clock::time_point poll{}, last=std::chrono::steady_clock::now();
 };
@@ -63,15 +116,18 @@ inline const char* Trigger() {
     static const char* value=[] {
         const char* p=BB_DIAGNOSTIC_ENV("BB_MESH_SEARCH");
         if(!p || !*p) return static_cast<const char*>(nullptr);
+        if(Targeting().requested && !Targeting().valid) return static_cast<const char*>(nullptr);
         if(!Configuration().offline) { std::fputs("MeshSearch: requires valid BB_MESH_PROBE signature; disabled\n",stderr); return static_cast<const char*>(nullptr); }
-        std::fputs("MeshSearch: waiting for trigger file; 64 MiB/lane, 2 MiB/binding, 1024 bindings, 4096 hit checks; CPU bytes only\n",stderr);
+        std::fprintf(stderr,"MeshSearch: waiting for trigger file; mode=%s 64 MiB scan/lane, 2 MiB/binding, %u bindings, 4096 hit checks; target=%016llx native=%u slot=%u; targeted anchors have separate 2 MiB budget\n",
+            Targeting().valid ? "targeted":"broad",Targeting().valid ? 4096u:1024u,
+            (unsigned long long)Targeting().resource,Targeting().native_vertices,Targeting().slot_vertices);
         return p;
     }();
     return value;
 }
 inline void Begin(bool indirect) {
     if(!Trigger()) return;
-    auto& s=search; s.hit_count=0; s.supported=0; s.indirect_draw=indirect;
+    auto& s=search; s.hit_count=0; s.candidate_count=0; s.supported=0; s.indirect_draw=indirect;
     const auto now=std::chrono::steady_clock::now();
     if(!s.armed && now-s.poll>=std::chrono::seconds(1)) {
         s.poll=now;
@@ -87,6 +143,10 @@ inline void Begin(bool indirect) {
             (unsigned long long)s.skips,(unsigned long long)s.full,(unsigned long long)s.found,
             (unsigned long long)s.referenced,(unsigned long long)s.stale,(unsigned long long)s.no_supported_bindings,s.checks);
         s.last=now;
+        if(Targeting().valid) std::fprintf(stderr,"MeshSearchTarget: lane=%u anchor-bytes=%llu anchor-hits=%llu shape-candidates=%llu shape-skipped=%llu scan-complete=%llu budget-skipped=%llu; shape is prioritization, not identity\n",
+            state.lane,(unsigned long long)s.anchor_bytes,(unsigned long long)s.anchor_hits,
+            (unsigned long long)s.shape_candidates,(unsigned long long)s.shape_skipped,
+            (unsigned long long)s.scan_complete,(unsigned long long)s.budget_skipped);
     }
 }
 inline bool Same(const Binding& a,const Binding& b) {
@@ -103,20 +163,34 @@ inline void Observe(const Binding& b) {
     auto& s=search; const auto& spec=Configuration().spec;
     if(!b.per_vertex || b.width!=spec.width || b.stride<b.width || b.stride>4096) { ++s.unsupported; return; }
     ++s.supported;
-    const Entry* entry=nullptr;
+    Entry* entry=nullptr;
     size_t slot=Key(b)%s.lookup.size();
     while(s.lookup[slot]) {
-        const auto& cached=s.cache[s.lookup[slot]-1];
+        auto& cached=s.cache[s.lookup[slot]-1];
         if(Same(cached.binding,b)) { entry=&cached; ++s.skips; break; }
         slot=(slot+1)%s.lookup.size();
     }
     if(!entry) {
-        if(s.used==s.cache.size()) { ++s.full; return; }
-        if(s.bytes>=ByteBudget) return;
-        auto& added=s.cache[s.used++]; added.binding=b;
+        if(s.used==(Targeting().valid ? 4096u:1024u)) { ++s.full; return; }
+        Result result;
+        if(Targeting().valid) {
+            result=Anchors(spec,b,AnchorBudget-s.anchor_bytes,runtime_memory_read_backing);
+            s.anchor_bytes+=result.bytes; s.failures+=result.failures;
+            if(result.found) ++s.anchor_hits;
+            if(result.truncated) { ++s.budget_skipped; return; }
+        }
+        const bool eligible=!Targeting().valid || Shape(Targeting(),b);
+        if(!result.found && eligible) {
+            const uint64_t window=uint64_t(spec.samples-1)*b.stride+b.width;
+            if(ByteBudget-s.bytes<window) { ++s.budget_skipped; return; }
+            ++s.shape_candidates;
+            result=Find(spec,b,ByteBudget-s.bytes,runtime_memory_read_backing);
+            s.bytes+=result.bytes; s.failures+=result.failures; s.truncated+=result.truncated;
+            if(!result.truncated && !result.failures) ++s.scan_complete;
+        } else if(!eligible) ++s.shape_skipped;
+        // A cached truncated result remains incomplete, never a completed negative scan.
+        auto& added=s.cache[s.used++]; added.binding=b; added.result=result;
         s.lookup[slot]=uint16_t(s.used);
-        added.result=Find(spec,b,ByteBudget-s.bytes,runtime_memory_read_backing);
-        s.bytes+=added.result.bytes; s.failures+=added.result.failures; s.truncated+=added.result.truncated;
         if(added.result.found) ++s.found;
         entry=&added;
         // A remaining budget smaller than one window cannot be used for this binding.
@@ -128,6 +202,9 @@ inline void Observe(const Binding& b) {
     if(entry->result.found && s.hit_count<s.hits.size()) {
         s.hits[s.hit_count]=*entry; s.hits[s.hit_count++].binding=b;
     }
+    if(Targeting().valid && Shape(Targeting(),b) && !entry->reported && s.candidate_logs<12 && s.candidate_count<s.candidates.size()) {
+        entry->binding=b; s.candidates[s.candidate_count++]=entry;
+    }
 }
 // Invoked only after the draw command is handed to the scheduler, on its owning lane.
 inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uintptr_t args=0,uint32_t stride=0,
@@ -135,6 +212,16 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uintptr_t args=0,uin
     if(!Trigger() || !search.armed) return;
     auto& s=search; const auto& spec=Configuration().spec;
     if(!s.supported) ++s.no_supported_bindings;
+    for(unsigned i=0;i<s.candidate_count && s.candidate_logs<12;++i) {
+        auto& entry=*s.candidates[i]; if(entry.reported) continue;
+        entry.reported=true; ++s.candidate_logs;
+        const auto& b=entry.binding;
+        std::fprintf(stderr,"MeshSearchTarget: lane=%u shape-candidate path=%s vb=0x%llx bytes=%llu vertices=%llu stride=%u base-vertex=%d count=%u ib=0x%llx vs=%llx ps=%llx cached-prefix=%d scan-truncated=%d; shape only, not resource identity\n",
+            state.lane,s.indirect_draw ? "indirect-unchecked":"direct",(unsigned long long)b.address,
+            (unsigned long long)b.size,(unsigned long long)Vertices(b),b.stride,int32_t(b.base_vertex),count,
+            (unsigned long long)(state.bound ? state.index:0),(unsigned long long)vs,(unsigned long long)ps,
+            int(entry.result.found),int(entry.result.truncated));
+    }
     for(unsigned i=0;i<s.hit_count && s.checks<4096;++i) {
         ++s.checks; const auto& hit=s.hits[i];
         if(!Fresh(spec,hit.binding,hit.result.vertex,runtime_memory_read_backing)) { ++s.stale; continue; }
@@ -152,5 +239,6 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uintptr_t args=0,uin
             (unsigned long long)vs,(unsigned long long)ps,(unsigned long long)args,stride,max_count,(unsigned long long)count_address);
     }
     s.hit_count=0;
+    s.candidate_count=0;
 }
 } // namespace BbMeshSearch

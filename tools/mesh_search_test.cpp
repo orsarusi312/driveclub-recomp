@@ -14,7 +14,13 @@ extern "C" int runtime_memory_read_backing(uintptr_t address,void* out,uint64_t 
 static std::string hex(const unsigned char* p,size_t n) {
     std::string s; for(size_t i=0;i<n;++i) { s+="0123456789abcdef"[p[i]>>4]; s+="0123456789abcdef"[p[i]&15]; } return s;
 }
-int main() {
+int main(int argc,char** argv) {
+    const bool targeted=argc==2 && !std::strcmp(argv[1],"--targeted");
+    BbMeshSearch::Target target;
+    assert(BbMeshSearch::ParseTarget("t1:0003000000000001:35189:47",target));
+    for(const auto* bad : {"", "t1:0004000000000001:35189:47", "t1:3:12:8", "t1:0003000000000001:0:0",
+                          "t1:0003000000000001:8:9", "t1:0003000000000001:999999999999:47", "t1:0003000000000001:9:8:1"})
+        assert(!BbMeshSearch::ParseTarget(bad,target));
     Spec spec; spec.width=12; spec.stride=16; spec.samples=8; spec.count=195; spec.first=1456;
     for(unsigned i=0;i<96;++i) spec.positions[i]=static_cast<unsigned char>(i+1);
     Binding b{0x1000,memory.size(),16,0,12,106,0,0,true};
@@ -31,6 +37,9 @@ int main() {
     uint64_t before=reads;
     result=BbMeshSearch::Find(spec,b,12,runtime_memory_read_backing);
     assert(!result.found && result.truncated && reads==before);
+    result=BbMeshSearch::Find(spec,b,128,runtime_memory_read_backing);
+    assert(!result.found && result.truncated && result.bytes==124); // bounded short tail, not zero-byte cache work
+    before=reads;
     Binding bad=b; bad.address=UINTPTR_MAX-8;
     assert(!BbMeshSearch::Find(spec,bad,100000,runtime_memory_read_backing).found && reads==before);
     bad=b; bad.size=10;
@@ -50,8 +59,10 @@ int main() {
     assert(std::filesystem::create_directory(root)); auto trigger=(root/"arm").string();
 #ifdef _WIN32
     _putenv_s("BB_MESH_PROBE",signature.c_str()); _putenv_s("BB_MESH_SEARCH",trigger.c_str());
+    _putenv_s("BB_MESH_SEARCH_TARGET",targeted ? "t1:0003000000000001:85:8":"");
 #else
     setenv("BB_MESH_PROBE",signature.c_str(),1); setenv("BB_MESH_SEARCH",trigger.c_str(),1);
+    if(targeted) setenv("BB_MESH_SEARCH_TARGET","t1:0003000000000001:85:8",1); else unsetenv("BB_MESH_SEARCH_TARGET");
 #endif
     before=reads; BbMeshSearch::Begin(false); BbMeshSearch::Observe(b); assert(reads==before);
     FILE* flag=std::fopen(trigger.c_str(),"wb"); assert(flag); std::fclose(flag);
@@ -77,6 +88,21 @@ int main() {
         BbMeshSearch::search.checks=4096; before=reads;
         BbMeshSearch::Begin(false); BbMeshSearch::Observe(b); BbMeshSearch::Recorded(1,2,3); assert(reads==before);
         std::thread worker([] { assert(BbMeshSearch::search.used==0 && !BbMeshSearch::search.armed); }); worker.join();
+        if(targeted) {
+            const auto scan_bytes=BbMeshSearch::search.bytes;
+            const auto anchor_bytes=BbMeshSearch::search.anchor_bytes;
+            for(unsigned i=0;i<100;++i) {
+                Binding unrelated{0x1000+200000+i*32,6400,16,0,12,106,0,0,true};
+                BbMeshSearch::Begin(false); BbMeshSearch::Observe(unrelated);
+            }
+            assert(BbMeshSearch::search.bytes==scan_bytes && BbMeshSearch::search.shape_skipped>=100);
+            assert(BbMeshSearch::search.anchor_bytes>anchor_bytes);
+            BbMeshSearch::search.bytes=BbMeshSearch::ByteBudget-10;
+            const auto used=BbMeshSearch::search.used;
+            Binding deferred=b; deferred.address=0x19000;
+            BbMeshSearch::Begin(false); BbMeshSearch::Observe(deferred);
+            assert(BbMeshSearch::search.used==used && BbMeshSearch::search.budget_skipped);
+        }
     } else assert(reads==before);
     std::filesystem::remove_all(root);
     // Half-width byte signatures remain exact; an instance-rate descriptor is excluded.
@@ -88,5 +114,15 @@ int main() {
     assert(result.found && result.vertex==5);
     hb.per_vertex=false; before=reads;
     assert(!BbMeshSearch::Find(half,hb,1024,runtime_memory_read_backing).found && reads==before);
+    // Cheap anchors find both canonical shared-buffer offsets and isolated starts.
+    hb.per_vertex=true; half.first=5;
+    auto anchor=BbMeshSearch::Anchors(half,hb,1024,runtime_memory_read_backing);
+    assert(anchor.found && anchor.vertex==5 && anchor.bytes==48);
+    for(unsigned i=0;i<8;++i) std::memcpy(memory.data()+i*8,half.positions.data()+i*6,6);
+    half.first=100;
+    anchor=BbMeshSearch::Anchors(half,hb,1024,runtime_memory_read_backing);
+    assert(anchor.found && anchor.vertex==0);
+    before=reads; anchor=BbMeshSearch::Anchors(half,hb,5,runtime_memory_read_backing);
+    assert(anchor.truncated && reads==before);
     puts("Mesh search: chunk boundaries, relocation/repacking, budgets, stale bytes, direct/indirect paths and TLS passed");
 }

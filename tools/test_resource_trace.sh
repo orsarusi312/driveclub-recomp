@@ -11,4 +11,5 @@ for mode in 0 1; do
     out/tests/rpk-trace-$mode.exe
     "$cxx" -std=c++17 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/mesh_search_test.cpp -o out/tests/mesh-search-$mode.exe
     out/tests/mesh-search-$mode.exe
+    out/tests/mesh-search-$mode.exe --targeted
 done

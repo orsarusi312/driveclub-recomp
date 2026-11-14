@@ -35,10 +35,17 @@ class TraceManifestTests(unittest.TestCase):
             import subprocess
             scan=json.loads(subprocess.check_output([str(dcmod),'mesh','scan',str(fixture)],text=True))
             target=scan['slots'][0]['target']; before=fixture.read_bytes()
+            bad=dict(scan['slots'][0]); fields=bad['draw_probe_signature'].split(':')
+            fields[6]=('1' if fields[6][0]!='1' else '2')+fields[6][1:]
+            bad['draw_probe_signature']=':'.join(fields)
+            with self.assertRaises(ValueError): trace.manifest(bad,fixture,'worlds/test.rpk')
             report=trace.prepare(dcmod,fixture,[],target,'worlds/test.rpk',output)
             self.assertEqual((output/'mods/worlds/test.rpk').read_bytes(),before)
             self.assertEqual(fixture.read_bytes(),before)
             self.assertEqual(report['source_sha256'],report['copy_sha256'])
             self.assertIn('/app0/worlds/test.rpk\n',(output/'rpk-trace.txt').read_text())
+            self.assertTrue((output/'rpk-trace.txt').read_text().startswith('rpk-trace-v2\n'))
+            self.assertIn('\nprefix ',(output/'rpk-trace.txt').read_text())
+            self.assertEqual((output/'mesh-search-target.txt').read_text().strip(),report['mesh_search_target'])
             with self.assertRaises(FileExistsError): trace.prepare(dcmod,fixture,[],target,'worlds/test.rpk',output)
             self.assertEqual((output/'mods/worlds/test.rpk').read_bytes(),before)

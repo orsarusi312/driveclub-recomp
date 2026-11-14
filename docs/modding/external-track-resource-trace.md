@@ -1,5 +1,10 @@
 # Road742: trace file reads and search actual vertex bindings
 
+Follow-up: the Windows run of `04fe187` verified headers but exhausted the broad
+search budget. See [targeted search findings](external-track-targeted-search.md).
+The launch commands below now prepare a v2 position-prefix trace and enable
+targeted search. Always prepare a **new** experiment folder with the rebuilt dcmod.
+
 ## Recovery and the Windows evidence
 
 This continues `584d04ea828283d620df3018a5dd0d785d6f86c3`. The interrupted
@@ -94,7 +99,9 @@ no longer exclude a candidate before it is searched.
 Limits are **per recording lane**:
 
 * 64 MiB total scanned bytes, including overlapping chunk reads; 2 MiB per binding.
-* 1,024 distinct descriptor layouts, a fixed-size hash lookup and 64 KiB scratch.
+* 1,024 distinct descriptor layouts in broad mode (4,096 in the new targeted mode),
+  a fixed-size hash lookup and 64 KiB scratch. Targeted checks have an additional
+  separate 2 MiB budget; see the follow-up guide above.
 * 32 candidate hits per draw, 4,096 later hit validations, 16 detailed hit lines.
 * Counters every five seconds; no forced GPU downloads, waits or synchronization.
 
@@ -157,7 +164,7 @@ Only use the original extracted stock RPK here. Generated RPK copies are private
 ```powershell
 $ErrorActionPreference='Stop'
 $Repo='H:\DC-Track-Test'
-$Run="$Repo\work\road742-resource-trace-$([guid]::NewGuid().ToString('N'))"
+$Run="$Repo\work\road742-targeted-search-$([guid]::NewGuid().ToString('N'))"
 $Input="$Run\inputs"
 python "$Repo\tools\track_import\prepare_resource_trace.py" `
   --dcmod "$Repo\out\dcmod.exe" `
@@ -186,6 +193,7 @@ try {
     $env:BB_RPK_TRACE_FILE="$Input\rpk-trace.txt"
     $env:BB_MESH_PROBE=(Get-Content -Raw "$Input\stock-probe.txt").Trim()
     $env:BB_MESH_SEARCH=$Trigger
+    $env:BB_MESH_SEARCH_TARGET=(Get-Content -Raw "$Input\mesh-search-target.txt").Trim()
     $env:BB_MESH_PROBE_CONTROL=$Trigger
     $env:BB_GPU_USER_DIR="$Run\user"
     $env:BB_CONFIG="$Run\user\driveclub.ini"

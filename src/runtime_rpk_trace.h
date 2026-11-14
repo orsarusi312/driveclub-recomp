@@ -9,7 +9,8 @@
 #include <pthread.h>
 
 typedef struct { uint64_t id, offset, size; } RpkTraceSpan;
-typedef struct { char path[512]; unsigned count; RpkTraceSpan spans[8]; } RpkTraceConfig;
+typedef struct { uint64_t id,offset,stride,width,samples; unsigned char bytes[96]; } RpkTracePrefix;
+typedef struct { char path[512]; unsigned count; RpkTraceSpan spans[8]; RpkTracePrefix prefix; } RpkTraceConfig;
 static int rpk_trace_number(char **p, int base, char separator, uint64_t *out) {
     char *end; const char *start=*p;
     if (!*start || !((*start>='0' && *start<='9') ||
@@ -20,15 +21,32 @@ static int rpk_trace_number(char **p, int base, char separator, uint64_t *out) {
 }
 static int rpk_trace_parse(char *text,RpkTraceConfig *out) {
     RpkTraceConfig c={0};
-    if (strncmp(text,"rpk-trace-v1\n",13)) return 0;
+    const int v2=!strncmp(text,"rpk-trace-v2\n",13);
+    if (!v2 && strncmp(text,"rpk-trace-v1\n",13)) return 0;
     char *p=text+13, *end=strchr(p,'\n');
     if (!end || end-p>=511 || strncmp(p,"/app0/",6)) return 0;
     memcpy(c.path,p,(size_t)(end-p));
     if (strstr(c.path,"..") || strchr(c.path,'\r')) return 0;
     p=end+1;
     while (*p) {
-        if (c.count==8 || !(end=strchr(p,'\n'))) return 0;
+        if (!(end=strchr(p,'\n'))) return 0;
         *end=0;
+        if (!strncmp(p,"prefix ",7)) {
+            if (!v2 || c.prefix.id) return 0;
+            p+=7; RpkTracePrefix *q=&c.prefix;
+            if (!rpk_trace_number(&p,16,' ',&q->id) || !rpk_trace_number(&p,10,' ',&q->offset) ||
+                !rpk_trace_number(&p,10,' ',&q->stride) || !rpk_trace_number(&p,10,' ',&q->width) ||
+                !rpk_trace_number(&p,10,' ',&q->samples) || q->id>>48!=3 ||
+                (q->width!=6 && q->width!=12) || q->samples<3 || q->samples>8 ||
+                q->stride<q->width || q->stride>4096 || strlen(p)!=q->width*q->samples*2) return 0;
+            for (size_t i=0;i<q->width*q->samples*2;++i) {
+                int n=p[i]>='0' && p[i]<='9' ? p[i]-'0':p[i]>='a' && p[i]<='f' ? p[i]-'a'+10:-1;
+                if (n<0) return 0;
+                q->bytes[i/2]=(unsigned char)((q->bytes[i/2]<<4)|n);
+            }
+            p=end+1; continue;
+        }
+        if (c.count==8) return 0;
         RpkTraceSpan *s=&c.spans[c.count];
         if (!rpk_trace_number(&p,16,' ',&s->id) || !rpk_trace_number(&p,10,' ',&s->offset) ||
             !rpk_trace_number(&p,10,0,&s->size) || !s->id || s->size<20 ||
@@ -40,6 +58,14 @@ static int rpk_trace_parse(char *text,RpkTraceConfig *out) {
         ++c.count; p=end+1;
     }
     if (!c.count) return 0;
+    if (v2) {
+        int found=0;
+        for (unsigned i=0;i<c.count;++i) if (c.spans[i].id==c.prefix.id) {
+            found=c.prefix.offset>=28 && c.prefix.offset<=c.spans[i].size &&
+                (c.prefix.samples-1)*c.prefix.stride+c.prefix.width<=c.spans[i].size-c.prefix.offset;
+        }
+        if (!found) return 0;
+    }
     *out=c; return 1;
 }
 /* Intersection is exact even for partial/split reads; file ranges include headers. */
@@ -70,6 +96,19 @@ static int rpk_trace_watches(const char *path) {
     return rpk_trace_config.count && !strcmp(path,rpk_trace_config.path);
 }
 extern int runtime_memory_read_backing(uintptr_t,void*,uint64_t);
+static const char *rpk_trace_check_prefix(const RpkTracePrefix *q,uint64_t id,uint64_t at,uint64_t length,
+                                        uintptr_t address,uintptr_t *prefix_address) {
+    *prefix_address=0;
+    if (q->id!=id) return "not-target";
+    const uint64_t span=(q->samples-1)*q->stride+q->width; /* config validated on input */
+    if (length>UINTPTR_MAX-address || q->offset<at || q->offset-at>length || span>length-(q->offset-at)) return "not-covered";
+    unsigned char row[12]; *prefix_address=address+(uintptr_t)(q->offset-at);
+    for (uint64_t j=0;j<q->samples;++j) {
+        if (!runtime_memory_read_backing(*prefix_address+j*q->stride,row,q->width)) return "unreadable";
+        if (memcmp(row,q->bytes+j*q->width,(size_t)q->width)) return "MISMATCH";
+    }
+    return "verified";
+}
 static void rpk_trace_note(const char *path,int64_t offset,uintptr_t buffer,int64_t bytes,const char *method) {
     if (offset<0 || bytes<=0 || !rpk_trace_watches(path)) return;
     if (__atomic_load_n(&rpk_trace_logs,__ATOMIC_RELAXED)>=64) return;
@@ -86,8 +125,10 @@ static void rpk_trace_note(const char *path,int64_t offset,uintptr_t buffer,int6
                 header=!memcmp(data,"EVOSLITL",8) && id==s.id ? "verified":"MISMATCH";
             }
         }
-        fprintf(stderr,"RpkTrace: id=%016llx file-offset=%llu resource-offset=%llu bytes=%llu guest=0x%llx header=%s method=%s; read destination only, lifetime/copies unknown\n",
+        uintptr_t prefix_address=0;
+        const char *prefix=rpk_trace_check_prefix(&rpk_trace_config.prefix,s.id,at,length,address,&prefix_address);
+        fprintf(stderr,"RpkTrace: id=%016llx file-offset=%llu resource-offset=%llu bytes=%llu guest=0x%llx header=%s method=%s position-prefix=%s prefix-guest=0x%llx; read destination only, lifetime/copies unknown\n",
             (unsigned long long)s.id,(unsigned long long)((uint64_t)offset+address-buffer),
-            (unsigned long long)at,(unsigned long long)length,(unsigned long long)address,header,method);
+            (unsigned long long)at,(unsigned long long)length,(unsigned long long)address,header,method,prefix,(unsigned long long)prefix_address);
     }
 }
