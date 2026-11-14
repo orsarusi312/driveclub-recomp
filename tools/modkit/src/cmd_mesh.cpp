@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // dcmod mesh ...: the geometry of resource packs as glTF 2.0 binary (.glb), for Blender and other editors.
 //
-// A model pack has "mesh" resources. Each depends on a position stream (a vertex buffer of 12 byte XYZ floats), a
-// attribute stream (normal, tangent, texture coordinates and so on; the first three are decoded) and an index buffer, and holds one or more
-// sub meshes: four 32 bit numbers (lowest vertex, highest vertex, first index, index count) after the bytes 02 03, and a
-// table at the end of the mesh (3, lowest vertex, 0, first index, index count) that the game draws from.
+// A model pack has "mesh" resources with position/attribute streams and an index buffer. Known layouts hold
+// sub meshes: four 32 bit numbers (lowest vertex, highest vertex, first index, index count) after the bytes 02 03,
+// plus matching draw-like records (3, lowest vertex, 0, first index, index count). Recognizing and updating those
+// records does not establish that a native scene instance selects them; runtime draw evidence is still required.
 // The indices are absolute positions in the vertex buffer and form a triangle list.
 #include "cli.hpp"
 #include "json.hpp"
@@ -168,6 +168,9 @@ std::vector<Sub> FindSubs(const RpkPack& pack, const MeshFormats& formats) {
             const size_t count = VbCount(*stream);
             if (!stride || count > (stream->data.size() - 28) / stride)
                 throw Error("invalid mesh buffer count/stride " + HexId(id));
+            const int position_kind=PositionKind(*stream);
+            if (position_kind && stride < (position_kind==2 ? 6u : 12u))
+                throw Error("position stride is smaller than XYZ encoding " + HexId(id));
             if (PositionKind(*stream) && stride < (PositionKind(*stream) == 2 ? 6u : 12u))
                 throw Error("invalid position stride " + HexId(id));
         }
@@ -352,12 +355,23 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
                 const std::vector<std::string>& targets) {
     Json report = Json::Object(), slots = Json::Array(), candidates = Json::Array();
     std::vector<const Sub*> ranked;
+    std::map<uint64_t,std::vector<const RpkResource*>> consumers;
+    for (const auto& resource:pack.resources)
+        for (uint64_t id:resource.deps) consumers[id].push_back(&resource);
     for (const Sub& s : subs) {
         if (!targets.empty() && std::none_of(targets.begin(), targets.end(), [&](const std::string& pattern) {
                 return WildMatch(Lower(pattern), Lower(s.name));
             })) continue;
         Json row = Json::Object(), blockers = Json::Array(), warnings = Json::Array(), streams = Json::Array();
         row.Set("target", s.name); row.Set("vertices", s.vertices()); row.Set("triangles", s.count / 3);
+        row.Set("mesh_resource",HexId(s.mesh));
+        Json owners=Json::Array();
+        for(const auto* owner:consumers[s.mesh]) {
+            Json ref=Json::Object(); ref.Set("id",HexId(owner->id));
+            ref.Set("type",RpkTypeName(owner->Type())); ref.Set("name",owner->DisplayName()); owners.Push(ref);
+        }
+        row.Set("local_resource_consumers",owners);
+        row.Set("consumer_scope","direct dependency IDs in this pack only; not decoded scene/LOD bindings");
         row.Set("normal_buffer", HexId(s.normal_buffer)); row.Set("uv_buffer", HexId(s.uv_buffer));
         row.Set("tangent_buffer", HexId(s.tangent_buffer)); row.Set("partial_layout", s.partial_layout);
         Json bound = Json::Array(); for (uint64_t id : RelocationStreams(s)) bound.Push(HexId(id));
@@ -367,6 +381,11 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
         row.Set("uv_decoded", s.uv_off >= 0); row.Set("skinned", s.skin != 0);
         row.Set("position_buffer", HexId(s.pos)); row.Set("attribute_buffer", HexId(s.attr));
         row.Set("index_buffer", HexId(s.ib)); row.Set("position_half_float", s.half);
+        row.Set("vertex_first", s.lo); row.Set("vertex_last", s.hi);
+        row.Set("index_first", s.first); row.Set("index_count", s.count);
+        row.Set("position_stride", s.pos_stride);
+        Json records=Json::Array(); for (size_t at:s.recs) records.Push(double(at));
+        row.Set("mesh_record_offsets", records);
         // Measured mesh-local vertices, NOT decoded native draw/culling bounds.
         std::array<double, 3> low{INFINITY, INFINITY, INFINITY}, high{-INFINITY, -INFINITY, -INFINITY};
         bool finite = true, exportable = true;
@@ -463,8 +482,28 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
         row.Set("independent_buffer_mentions", independent);
         if (!independent) blockers.Push("buffer_mentions_missing_or_shared_with_previous_slot");
         Bytes draw; Wr32(draw,3); Wr32(draw,s.lo); Wr32(draw,0); Wr32(draw,s.first); Wr32(draw,s.count);
-        bool has_draw=std::search(mesh.data.begin(),mesh.data.end(),draw.begin(),draw.end())!=mesh.data.end();
+        Json draws=Json::Array();
+        for (size_t at=0;at+draw.size()<=mesh.data.size();++at)
+            if (!std::memcmp(mesh.data.data()+at,draw.data(),draw.size())) draws.Push(double(at));
+        bool has_draw=!draws.Items().empty();
+        row.Set("draw_record_offsets",draws);
         row.Set("draw_table_found",has_draw);
+        // Bounded raw-position/index signature for an opt-in renderer probe.
+        // No claim that a matching resource is selected by the native scene.
+        const auto hex=[](const uint8_t* data,size_t n) {
+            const char* digits="0123456789abcdef"; std::string out;
+            for(size_t i=0;i<n;++i) { out+=digits[data[i]>>4]; out+=digits[data[i]&15]; }
+            return out;
+        };
+        const uint32_t samples=std::min(8u,s.vertices()), width=s.half ? 6 : 12;
+        std::string prefix;
+        for(uint32_t i=0;i<samples;++i)
+            prefix+=hex(positions.data()+28+size_t(s.lo+i)*s.pos_stride,width);
+        const auto& index_data=pack.Find(s.ib)->data;
+        const auto index_prefix=hex(index_data.data()+28+size_t(s.first)*2,size_t(std::min(24u,s.count))*2);
+        row.Set("draw_probe_signature", "v1:"+std::to_string(s.pos_stride)+":"+std::to_string(width)+":"+
+                std::to_string(samples)+":"+std::to_string(s.count)+":"+std::to_string(s.lo)+":"+prefix+":"+index_prefix);
+        row.Set("draw_probe_scope","raw position/index prefix; direct indexed draws; identical geometry can also match");
         if (!has_draw) blockers.Push("draw_table_entry_not_found");
         if (s.partial_layout) warnings.Push("unknown_suffix_not_decoded_full_donor_rows_preserved_shader_semantics_unverified");
         if (s.tangent_off<0) warnings.Push("tangent_not_decoded_material_compatibility_unverified");

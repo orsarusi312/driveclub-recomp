@@ -253,3 +253,8 @@ comparison. If binding checks still fail, return the reduced report rather than
 relaxing the checks. If staging succeeds but geometry is absent, the next gate
 is measured world placement, native scene/culling ownership and GPU draw evidence;
 source names and successful file replacement alone are not rendering proof.
+
+Windows has since confirmed startup/driving and replacement of the Road742 RPK,
+but not visible custom geometry. Continue with the
+[bounded visual-marker and draw-recording experiment](external-track-visual-marker.md),
+using separate stock, isolated-control and inset-marker runs.

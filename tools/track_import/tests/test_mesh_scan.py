@@ -34,6 +34,32 @@ class MeshScanTests(unittest.TestCase):
         self.assertEqual(a['shared_buffer_slots'],[b['target']]); self.assertTrue(a['independent_buffer_mentions'])
         self.assertEqual(a['shared_index_buffer_slots'],[b['target']])
         self.assertEqual(a['vertex_bounds'], [[0,0,0], [11,0,1]])
+        self.assertEqual(a['vertex_first'],0)
+        self.assertEqual(a['index_count'],3)
+        self.assertTrue(a['draw_record_offsets'])
+        self.assertTrue(a['mesh_record_offsets'])
+        self.assertTrue(a['draw_probe_signature'].startswith('v1:12:12:8:3:0:'))
+
+    def test_position_stride_rejected_before_prefix_read(self):
+        record=next(r for r in self.doc['resources'] if r['id']=='0003000000000001')
+        path=self.root/'unpacked'/record['file']
+        data=bytearray(path.read_bytes()); struct.pack_into('<H',data,22,4); path.write_bytes(data)
+        self.runcli('rpk','build',self.root/'unpacked','-o',self.root/'bad.rpk')
+        r=subprocess.run([self.exe,'mesh','scan',str(self.root/'bad.rpk')],capture_output=True,text=True)
+        self.assertEqual(r.returncode,1)
+        self.assertIn('position stride is smaller than XYZ encoding',r.stderr)
+
+    def test_consumer_ids_are_metadata_not_lod_inference(self):
+        resource_id=0x0014000000000011
+        path=self.root/'unpacked'/'scene_object'/'consumer.res'; path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b'EVOSLITL'+struct.pack('<QI',resource_id,1))
+        self.doc['resources'].append({'id':f'{resource_id:016x}','type':'scene_object',
+            'order':len(self.doc['resources']),'names':['synthetic_consumer'],'sources':[],
+            'deps':['0008000000000001'],'content':'raw','file':'scene_object/consumer.res'})
+        self.manifest.write_text(json.dumps(self.doc))
+        row=self.scan()['slots'][0]
+        self.assertEqual(row['local_resource_consumers'],[{'id':f'{resource_id:016x}',
+            'type':'scene_object','name':'synthetic_consumer'}])
 
     def test_nonfinite_and_unexportable_donor_positions(self):
         record=next(r for r in self.doc['resources'] if r['id']=='0003000000000001')

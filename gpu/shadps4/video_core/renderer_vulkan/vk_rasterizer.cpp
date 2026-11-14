@@ -1,4 +1,5 @@
 #include "../../../shim/bbport_diagnostics.h"
+#include "../../../shim/bbport_mesh_probe.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -1359,6 +1360,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         scheduler.PopPendingOperations();
     }
     const auto& regs = Regs();
+    if constexpr (BB_DIAGNOSTICS) {
+        const u32 width=regs.index_buffer_type.index_type==AmdGpu::IndexType::Index16 ? 2u : 4u;
+        BbMeshProbe::Begin(is_indexed,regs.num_indices,
+            regs.index_base_address.Address<VAddr>()+u64(index_offset)*width,width);
+    }
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
     // target is that frame.
     const bool display_draw =
@@ -1630,6 +1636,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     {
         const auto* recent_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         BbRecent::Draw(vs_info.pgm_hash, recent_ps ? recent_ps->pgm_hash : 0, num_indices, num_instances);
+        if constexpr (BB_DIAGNOSTICS)
+            BbMeshProbe::Recorded(vs_info.pgm_hash,recent_ps ? recent_ps->pgm_hash : 0,num_indices,num_instances);
     }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
@@ -1942,6 +1950,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     const IndirectDraw& indirect) {
+    if constexpr (BB_DIAGNOSTICS) BbMeshProbe::Begin(false,0,0,0,true);
     buffer_cache.ApplyQueuedStores(); // bbport: guest stores emulated before this work
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
@@ -2644,6 +2653,13 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     if (bindings.empty()) {
         // If there are no bindings, there is nothing further to do.
         return;
+    }
+    if constexpr (BB_DIAGNOSTICS) {
+        if (BbMeshProbe::Configuration().enabled) {
+            const auto offsets=GetDrawOffsets(regs,pipeline->GetStage(Shader::SwStage::Vertex),fetch);
+            for(const auto& buffer:guest_buffers)
+                BbMeshProbe::Observe(buffer.base_address,buffer.GetSize(),buffer.GetStride(),offsets.first);
+        }
     }
     if (motion_draw && !guest_buffers.empty()) {
         // Include every stream: identical position buffers can be paired with different

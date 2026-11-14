@@ -11,6 +11,7 @@ out/track-fixture work/track-fixture.rpk
 exe="$PWD/out/dcmod"
 [[ -f out/dcmod.exe ]] && exe="$PWD/out/dcmod.exe"
 fixture="$PWD/work/track-fixture.rpk"
+bash tools/test_mesh_probe.sh
 if [[ ${OS:-} == Windows_NT ]]; then
     exe=$(cygpath -w "$exe")
     fixture=$(cygpath -w "$fixture")

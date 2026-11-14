@@ -22,3 +22,8 @@ source contain original data only. Source is GPL-2.0-or-later.
 The [continuation report](../../docs/modding/external-track-progress.md) covers
 v2 collision/spawn authoring, GLB/glTF dependency preflight, native contact
 diagnostics, current status and transfer instructions. V2 is offline only.
+
+If a staged mesh re-exports correctly but is not visible, use
+[`visual_marker.py` and the draw probe](../../docs/modding/external-track-visual-marker.md)
+to compare stock, isolated control and a donor-local inset. It does not modify
+scene bounds or physics, and a matching recorded draw is not proof of visibility.
