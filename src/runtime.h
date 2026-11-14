@@ -38,6 +38,8 @@ uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 /* Fatal-fault diagnostics only: never dereferences guest bytes or waits for the memory table. */
 void runtime_memory_diagnose(uintptr_t address);
+/* Read-only diagnostic alias snapshot; zero for unmapped/reserved/cross-region ranges. */
+uintptr_t runtime_memory_debug_backing_address(uintptr_t address, uint64_t size);
 uint64_t runtime_memory_direct_size(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 const char *runtime_import_name(const char *name);

@@ -991,6 +991,25 @@ static int backing_copy(uintptr_t address, void *data, uint64_t size, int to_bac
     read_unlock();
     return ok;
 }
+/* Diagnostic snapshot only, not a lifetime lease. No bytes/protections are changed.
+ * A hardware watchpoint on guest VA alone misses host reads through this alias. */
+uintptr_t runtime_memory_debug_backing_address(uintptr_t address,uint64_t size) {
+    if(!size || size>UINTPTR_MAX-address) return 0;
+    uintptr_t result=0;
+    read_lock();
+    const size_t i=vma_index(address);
+    if(backing_base && i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED &&
+       size<=vmas[i].end-address) {
+        const uint64_t delta=address-vmas[i].start;
+        if(vmas[i].phys<=UINT64_MAX-delta) {
+            const uint64_t offset=vmas[i].phys+delta;
+            if(offset<=UINTPTR_MAX-(uintptr_t)backing_base &&
+               size<=UINTPTR_MAX-((uintptr_t)backing_base+offset)) result=(uintptr_t)backing_base+offset;
+        }
+    }
+    read_unlock();
+    return result;
+}
 /* Writes through the backing view; 0 when part of the range has no backing. */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) { return backing_copy(address,(void *)data,size,1); }
 /* Reads through the backing view: the GPU side copies guest data (uploads) without raising read faults. */

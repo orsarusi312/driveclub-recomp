@@ -1,6 +1,6 @@
 # Road742: trace file reads and search actual vertex bindings
 
-Latest experiment: [shader-filtered buffer acquisition](external-track-buffer-path.md).
+Latest experiment: [verified read boundary and debugger watchpoints](external-track-read-boundary.md).
 Use that guide for the next run. The commands below retain the earlier observed-layout experiment.
 
 Follow-up: the Windows run of `04fe187` verified headers but exhausted the broad

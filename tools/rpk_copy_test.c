@@ -1,6 +1,10 @@
 #define _GNU_SOURCE
 #include "../src/runtime_rpk_trace.h"
 #include <assert.h>
+#ifdef _WIN32
+/* No real mappings or debugger break are used by the standalone observer tests. */
+uintptr_t runtime_memory_debug_backing_address(uintptr_t address,uint64_t size) { (void)address; (void)size; return 0; }
+#endif
 static unsigned char memory[2048];
 static unsigned reads;
 int runtime_memory_read_backing(uintptr_t address,void *out,uint64_t size) {

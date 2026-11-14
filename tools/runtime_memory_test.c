@@ -38,6 +38,9 @@ static void check_host(uintptr_t address, int committed, int writable) {
 }
 int main(void) {
     check_report(boundary,"tables unavailable");
+    assert(!runtime_memory_debug_backing_address(boundary,1));
+    assert(!runtime_memory_debug_backing_address(UINTPTR_MAX,8));
+    assert(!runtime_memory_debug_backing_address(boundary,0));
     uintptr_t base=boundary-2*PAGE;
     void *reserved=(void *)base;
 #ifdef _WIN32
@@ -53,6 +56,7 @@ int main(void) {
     check_report(boundary,"address not in a recorded VMA");
     assert(!reserve_range(&reserved,6*PAGE,MAP_FIXED_FLAG,PAGE));
     check_report(boundary,"kind=reserved");
+    assert(!runtime_memory_debug_backing_address(boundary,1));
     check_host(boundary,0,0);
     int64_t phys=-1;
     assert(!direct_allocate(0,(int64_t)POOL_SIZE,6*PAGE,PAGE,3,&phys));
@@ -63,6 +67,9 @@ int main(void) {
     *left=0x1234; *right=0x5678;
     uint64_t copy=0;
     assert(runtime_memory_read_backing(boundary,&copy,8) && copy==*right);
+    uintptr_t alias=runtime_memory_debug_backing_address(boundary,8);
+    assert(alias && *(const uint64_t*)alias==copy && *right==0x5678);
+    assert(!runtime_memory_debug_backing_address(base,4*PAGE+1));
     assert(!kernel_mprotect((void *)base,PAGE,1));
     check_host(base,1,0);
     /* Split a section into left, replacement and right views. The left view
@@ -74,6 +81,8 @@ int main(void) {
         assert(*left==0x1234);
         check_host(base,1,0); check_host(boundary-8,1,1); check_host(boundary,1,1);
         assert(runtime_memory_read_backing(boundary,&copy,8) && copy==*right);
+        uintptr_t remapped_alias=runtime_memory_debug_backing_address(boundary,8);
+        assert(remapped_alias && remapped_alias!=alias && *(const uint64_t*)remapped_alias==copy);
         check_report(boundary,"guest containing [0x513b600000,");
         assert(direct_map(&slot,PAGE,3,MAP_FIXED_FLAG|MAP_NO_OVERWRITE,phys,PAGE)==NO_MEMORY);
         assert(!direct_unmap((void *)boundary,PAGE));
@@ -83,12 +92,15 @@ int main(void) {
         assert(runtime_memory_is_mapped(boundary-8,8));
         assert(!runtime_memory_is_mapped(boundary-8,16));
         assert(!runtime_memory_read_backing(boundary,&copy,8));
+        assert(!runtime_memory_debug_backing_address(boundary,1));
     }
     mapped=(void *)boundary;
     assert(!direct_map(&mapped,PAGE,3,MAP_FIXED_FLAG,phys+4*PAGE,PAGE));
     runtime_memory_gpu_protect(boundary,PAGE,1,0);
     check_report(boundary,"prot=0x3"); /* guest permissions differ from host */
     check_host(boundary,1,0); /* reporter must not change protection */
+    assert(runtime_memory_debug_backing_address(boundary,1));
+    check_host(boundary,1,0); /* alias lookup must not change protection either */
     runtime_memory_gpu_protect(boundary,PAGE,1,1);
     *right=0xbeef;
     write_lock(); check_report(boundary,"tables unavailable"); write_unlock();
