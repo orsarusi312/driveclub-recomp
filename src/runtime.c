@@ -9,6 +9,9 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <pthread.h>
+#include <errno.h>
+#include "../gpu/shim/bbport_diagnostics.h"
+#include "runtime_rpk_copy.h"
 
 typedef struct {
     union { GuestCallback plain; void (ABI *with_arg)(void *); } callback;
@@ -197,23 +200,37 @@ static ABI void *guest_memset(void *dst, int value, size_t size) {
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+#if BB_DIAGNOSTICS
+    RpkCopyTicket trace; int prior_errno=errno;
+    runtime_rpk_copy_begin((uintptr_t)src,(uintptr_t)dst,size,&trace); errno=prior_errno;
+#endif
+    void *result=dst;
     if (size >= MEMOPS_MIN &&
         (bbgpu_guest_gpu_pages((uintptr_t)dst, size) || bbgpu_guest_gpu_pages((uintptr_t)src, size))) {
         memops_copy(dst, src, size); /* memcpy ranges do not overlap: chunk by chunk is the same copy */
-        return dst;
-    }
-    return memcpy(dst, src, size);
+    } else result=memcpy(dst, src, size);
+#if BB_DIAGNOSTICS
+    prior_errno=errno; runtime_rpk_copy_end(&trace); errno=prior_errno;
+#endif
+    return result;
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+#if BB_DIAGNOSTICS
+    RpkCopyTicket trace; int prior_errno=errno;
+    runtime_rpk_copy_begin((uintptr_t)src,(uintptr_t)dst,size,&trace); errno=prior_errno;
+#endif
+    void *result=dst;
     /* Overlapping moves keep the CRT (a forward chunked copy could read bytes it already overwrote). */
     const uintptr_t d = (uintptr_t)dst, s = (uintptr_t)src;
     if (size >= MEMOPS_MIN && (d + size <= s || s + size <= d) &&
         (bbgpu_guest_gpu_pages(d, size) || bbgpu_guest_gpu_pages(s, size))) {
         memops_copy(dst, src, size);
-        return dst;
-    }
-    return memmove(dst, src, size);
+    } else result=memmove(dst, src, size);
+#if BB_DIAGNOSTICS
+    prior_errno=errno; runtime_rpk_copy_end(&trace); errno=prior_errno;
+#endif
+    return result;
 }
 static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);

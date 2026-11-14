@@ -2,6 +2,7 @@
 #pragma once
 #include "bbport_mesh_probe.h"
 #include <charconv>
+#include "../../src/runtime_rpk_copy.h"
 namespace BbMeshSearch {
 using namespace BbMeshProbe;
 constexpr uint64_t ByteBudget=64ull*1024*1024, BindingLimit=2ull*1024*1024;
@@ -35,21 +36,24 @@ inline bool Shape(const Target& t,const Binding& b) {
     const uint64_t n=Vertices(b);
     return n==t.native_vertices || n==t.slot_vertices;
 }
-struct Result { bool found=false, truncated=false; uint64_t vertex=0, bytes=0, failures=0; };
+struct Result { bool found=false, truncated=false; uint64_t vertex=0, bytes=0, failures=0;
+    unsigned anchor_attempts=0, anchor_short=0, anchor_mismatch=0, anchor_range=0; };
 // Cheap independent pool: native offset and isolated/repacked start, never numeric tolerance.
 inline Result Anchors(const Spec& spec,const Binding& b,uint64_t budget,Read read) {
     Result r; std::array<unsigned char,12> row{};
     if(!b.per_vertex || b.width!=spec.width || b.stride<b.width || b.stride>4096) return r;
-    for(uint32_t first : {spec.first,0u}) {
-        if(first==0 && spec.first==0 && r.bytes) break;
-        if(Vertices(b)<uint64_t(first)+spec.samples) continue;
+    for(unsigned which=0;which<2;++which) {
+        if(which && !spec.first) break;
+        const uint32_t first=which ? 0:spec.first;
+        if(Vertices(b)<uint64_t(first)+spec.samples) { ++r.anchor_short; continue; }
+        ++r.anchor_attempts;
         bool match=true;
         for(uint32_t i=0;i<spec.samples;++i) {
             if(spec.width>budget-r.bytes) { r.truncated=true; return r; }
             r.bytes+=spec.width;
             Gate gate=ReadVertex(b,int64_t(first)+i,row.data(),read);
-            if(gate!=Gate::Match) { if(gate==Gate::Read) ++r.failures; match=false; break; }
-            if(std::memcmp(row.data(),spec.positions.data()+i*spec.width,spec.width)) { match=false; break; }
+            if(gate!=Gate::Match) { if(gate==Gate::Read) ++r.failures; else ++r.anchor_range; match=false; break; }
+            if(std::memcmp(row.data(),spec.positions.data()+i*spec.width,spec.width)) { ++r.anchor_mismatch; match=false; break; }
         }
         if(match) { r.found=true; r.vertex=first; return r; }
     }
@@ -99,7 +103,57 @@ inline unsigned Referenced(const Spec& spec,const Binding& b,uint64_t vertex,con
     return count;
 }
 struct Entry { Binding binding; Result result; bool reported=false; };
+enum class Rejection { Instance, Format, Width, Stride, Bounds, Shape, Eligible };
+inline Rejection Classify(const Spec& spec,const Target& target,const Binding& b) {
+    if(!b.per_vertex) return Rejection::Instance;
+    if(!b.width) return Rejection::Format;
+    if(b.width!=spec.width) return Rejection::Width;
+    if(b.stride<b.width || b.stride>4096) return Rejection::Stride;
+    if(b.offset>b.size || b.size-b.offset<b.width || b.address>UINTPTR_MAX-b.size) return Rejection::Bounds;
+    if(target.valid && !Shape(target,b)) return Rejection::Shape;
+    return Rejection::Eligible;
+}
+struct Layouts {
+    struct Row { Binding b; Rejection reason{}; bool indirect=false; uint64_t count=0; };
+    std::array<Row,1024> rows{};
+    uint64_t observations=0, overflow=0; unsigned reports=0;
+    void Add(const Binding& b,Rejection reason,bool indirect) {
+        ++observations;
+        uint64_t h=b.size^(uint64_t(b.stride)<<32)^(uint64_t(b.format)<<12)^b.offset^
+            (uint64_t(b.width)<<48)^(uint64_t(reason)<<56)^uint64_t(indirect);
+        h^=h>>30; h*=UINT64_C(0xbf58476d1ce4e5b9); h^=h>>27;
+        for(unsigned n=0;n<8;++n) {
+            auto& row=rows[(h+n)%rows.size()];
+            if(!row.count || (row.b.size==b.size && row.b.stride==b.stride && row.b.format==b.format &&
+                row.b.offset==b.offset && row.b.width==b.width && row.reason==reason && row.indirect==indirect)) {
+                if(!row.count) row={b,reason,indirect,0};
+                ++row.count; return;
+            }
+        }
+        ++overflow; // Bounded lookup; tracked counts are exact, omitted layouts explicitly counted.
+    }
+    void Print(unsigned lane) {
+        if(reports++>=12) return;
+        std::array<unsigned,1024> order{}; unsigned used=0;
+        for(unsigned i=0;i<rows.size();++i) if(rows[i].count) order[used++]=i;
+        const unsigned top=std::min(used,8u);
+        std::partial_sort(order.begin(),order.begin()+top,order.begin()+used,
+            [&](unsigned a,unsigned b){return rows[a].count>rows[b].count;});
+        const char* reasons[]={"instance-rate","unsupported-format","xyz-width","stride","bounds","record-count","eligible"};
+        std::fprintf(stderr,"MeshLayouts: lane=%u observations=%llu tracked=%u overflow=%llu report=%u; top tracked tuples, counts are observations not unique buffers\n",
+            lane,(unsigned long long)observations,used,(unsigned long long)overflow,reports);
+        for(unsigned i=0;i<top;++i) {
+            const auto& r=rows[order[i]];
+            std::fprintf(stderr,"MeshLayouts: lane=%u count=%llu path=%s bytes=%llu records=%llu stride=%u format=%u xyz-width=%u attr-offset=%u reason=%s example-vb=0x%llx\n",
+                lane,(unsigned long long)r.count,r.indirect ? "indirect":"direct",(unsigned long long)r.b.size,
+                (unsigned long long)(r.b.stride ? r.b.size/r.b.stride:0),r.b.stride,r.b.format,r.b.width,r.b.offset,
+                reasons[unsigned(r.reason)],(unsigned long long)r.b.address);
+        }
+    }
+};
+inline bool LayoutsOn() { static bool on=[] { const char* p=BB_DIAGNOSTIC_ENV("BB_MESH_LAYOUTS"); return p && !std::strcmp(p,"1"); }(); return on; }
 struct SearchState {
+    Layouts layouts;
     std::array<Entry,4096> cache{};
     std::array<uint16_t,8192> lookup{}; // index+1, bounded open addressing, at most half full
     std::array<Entry,32> hits{};
@@ -107,7 +161,8 @@ struct SearchState {
     unsigned used=0, hit_count=0, candidate_count=0, candidate_logs=0, supported=0, logs=0, checks=0;
     uint64_t bytes=0, failures=0, truncated=0, unsupported=0, skips=0, full=0,
              direct=0, indirect=0, found=0, referenced=0, stale=0, no_supported_bindings=0,
-             anchor_bytes=0, anchor_hits=0, shape_candidates=0, shape_skipped=0, scan_complete=0, budget_skipped=0;
+             anchor_bytes=0, anchor_hits=0, shape_candidates=0, shape_skipped=0, scan_complete=0, budget_skipped=0,
+             anchor_attempts=0, anchor_short=0, anchor_mismatch=0, anchor_range=0, copy_candidates=0, copy_hits=0;
     bool armed=false, indirect_draw=false, budget_reported=false;
     std::chrono::steady_clock::time_point poll{}, last=std::chrono::steady_clock::now();
 };
@@ -143,10 +198,15 @@ inline void Begin(bool indirect) {
             (unsigned long long)s.skips,(unsigned long long)s.full,(unsigned long long)s.found,
             (unsigned long long)s.referenced,(unsigned long long)s.stale,(unsigned long long)s.no_supported_bindings,s.checks);
         s.last=now;
-        if(Targeting().valid) std::fprintf(stderr,"MeshSearchTarget: lane=%u anchor-bytes=%llu anchor-hits=%llu shape-candidates=%llu shape-skipped=%llu scan-complete=%llu budget-skipped=%llu; shape is prioritization, not identity\n",
+        if(Targeting().valid) std::fprintf(stderr,"MeshSearchTarget: lane=%u anchor-bytes=%llu anchor-hits=%llu shape-candidates=%llu shape-skipped=%llu scan-complete=%llu budget-skipped=%llu anchor-attempts=%llu anchor-too-short=%llu anchor-mismatch=%llu anchor-range=%llu; shape is prioritization, not identity\n",
             state.lane,(unsigned long long)s.anchor_bytes,(unsigned long long)s.anchor_hits,
             (unsigned long long)s.shape_candidates,(unsigned long long)s.shape_skipped,
-            (unsigned long long)s.scan_complete,(unsigned long long)s.budget_skipped);
+            (unsigned long long)s.scan_complete,(unsigned long long)s.budget_skipped,
+            (unsigned long long)s.anchor_attempts,(unsigned long long)s.anchor_short,
+            (unsigned long long)s.anchor_mismatch,(unsigned long long)s.anchor_range);
+        if(LayoutsOn()) s.layouts.Print(state.lane);
+        if(Targeting().valid) std::fprintf(stderr,"MeshCopyBinding: lane=%u candidates=%llu fresh-matches=%llu; historical address candidates require fresh bytes\n",
+            state.lane,(unsigned long long)s.copy_candidates,(unsigned long long)s.copy_hits);
     }
 }
 inline bool Same(const Binding& a,const Binding& b) {
@@ -161,6 +221,7 @@ inline uint64_t Key(const Binding& b) {
 inline void Observe(const Binding& b) {
     if(!Trigger() || !search.armed) return;
     auto& s=search; const auto& spec=Configuration().spec;
+    if(LayoutsOn()) s.layouts.Add(b,Classify(spec,Targeting(),b),s.indirect_draw);
     if(!b.per_vertex || b.width!=spec.width || b.stride<b.width || b.stride>4096) { ++s.unsupported; return; }
     ++s.supported;
     Entry* entry=nullptr;
@@ -174,9 +235,26 @@ inline void Observe(const Binding& b) {
         if(s.used==(Targeting().valid ? 4096u:1024u)) { ++s.full; return; }
         Result result;
         if(Targeting().valid) {
-            result=Anchors(spec,b,AnchorBudget-s.anchor_bytes,runtime_memory_read_backing);
+            uintptr_t at=0; uint64_t id=0;
+            if(b.offset<=b.size && b.address<=UINTPTR_MAX-b.offset &&
+               runtime_rpk_copy_find(b.address+b.offset,b.size-b.offset,&at,&id) && id==Targeting().resource &&
+               at>=b.address+b.offset && (at-b.address-b.offset)%b.stride==0) {
+                ++s.copy_candidates;
+                const uint64_t cost=uint64_t(spec.samples)*spec.width;
+                if(cost<=AnchorBudget-s.anchor_bytes) {
+                    s.anchor_bytes+=cost;
+                    const uint64_t vertex=(at-b.address-b.offset)/b.stride;
+                    if(Fresh(spec,b,vertex,runtime_memory_read_backing)) {
+                        result.found=true; result.vertex=vertex; ++s.copy_hits;
+                    }
+                }
+            }
+            const bool copied=result.found;
+            if(!copied) result=Anchors(spec,b,AnchorBudget-s.anchor_bytes,runtime_memory_read_backing);
             s.anchor_bytes+=result.bytes; s.failures+=result.failures;
-            if(result.found) ++s.anchor_hits;
+            s.anchor_attempts+=result.anchor_attempts; s.anchor_short+=result.anchor_short;
+            s.anchor_mismatch+=result.anchor_mismatch; s.anchor_range+=result.anchor_range;
+            if(result.found && !copied) ++s.anchor_hits;
             if(result.truncated) { ++s.budget_skipped; return; }
         }
         const bool eligible=!Targeting().valid || Shape(Targeting(),b);

@@ -79,6 +79,8 @@ static int rpk_trace_overlap(RpkTraceSpan s,uint64_t offset,uint64_t bytes,uintp
 static RpkTraceConfig rpk_trace_config;
 static pthread_once_t rpk_trace_once=PTHREAD_ONCE_INIT;
 static unsigned rpk_trace_logs;
+extern int runtime_memory_read_backing(uintptr_t,void*,uint64_t);
+#include "runtime_rpk_copy_impl.h"
 static void rpk_trace_init(void) {
     const char *path=BB_DIAGNOSTIC_ENV("BB_RPK_TRACE_FILE");
     if (!path || !*path) return;
@@ -90,6 +92,9 @@ static void rpk_trace_init(void) {
     }
     fprintf(stderr,"RpkTrace: enabled path=%s resources=%u limit=64; file reads only, not native selection\n",
             rpk_trace_config.path,rpk_trace_config.count);
+    const char *copy=BB_DIAGNOSTIC_ENV("BB_RPK_COPY_TRACE");
+    rpk_copy_enabled=copy && !strcmp(copy,"1") && rpk_trace_config.prefix.id;
+    if(rpk_copy_enabled) fputs("RpkCopy: enabled; waits for verified read prefix; 16 addresses, 262144 HLE calls, 64 candidate copies\n",stderr);
 }
 static int rpk_trace_watches(const char *path) {
     pthread_once(&rpk_trace_once,rpk_trace_init);
@@ -127,6 +132,7 @@ static void rpk_trace_note(const char *path,int64_t offset,uintptr_t buffer,int6
         }
         uintptr_t prefix_address=0;
         const char *prefix=rpk_trace_check_prefix(&rpk_trace_config.prefix,s.id,at,length,address,&prefix_address);
+        if(!strcmp(prefix,"verified") && (!strcmp(header,"verified") || !strcmp(header,"partial"))) rpk_copy_seed(prefix_address);
         fprintf(stderr,"RpkTrace: id=%016llx file-offset=%llu resource-offset=%llu bytes=%llu guest=0x%llx header=%s method=%s position-prefix=%s prefix-guest=0x%llx; read destination only, lifetime/copies unknown\n",
             (unsigned long long)s.id,(unsigned long long)((uint64_t)offset+address-buffer),
             (unsigned long long)at,(unsigned long long)length,(unsigned long long)address,header,method,prefix,(unsigned long long)prefix_address);

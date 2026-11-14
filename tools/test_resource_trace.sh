@@ -9,6 +9,8 @@ if [[ ${SANITIZE:-0} == 1 ]]; then flags+=(-fsanitize=address,undefined -fno-san
 for mode in 0 1; do
     "$cc" -std=c11 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/rpk_trace_test.c -o out/tests/rpk-trace-$mode.exe
     out/tests/rpk-trace-$mode.exe
+    "$cc" -std=c11 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/rpk_copy_test.c -o out/tests/rpk-copy-$mode.exe
+    out/tests/rpk-copy-$mode.exe
     "$cxx" -std=c++17 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/mesh_search_test.cpp -o out/tests/mesh-search-$mode.exe
     out/tests/mesh-search-$mode.exe
     out/tests/mesh-search-$mode.exe --targeted

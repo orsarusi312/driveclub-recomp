@@ -6,6 +6,11 @@
 using namespace BbMeshProbe;
 static std::vector<unsigned char> memory(3*1024*1024);
 static uint64_t reads=0;
+static uintptr_t copy_prefix;
+extern "C" int runtime_rpk_copy_find(uintptr_t address,uint64_t bytes,uintptr_t* at,uint64_t* id) {
+    if(!copy_prefix || copy_prefix<address || copy_prefix-address>=bytes) return 0;
+    *at=copy_prefix; *id=UINT64_C(0x0003000000000001); return 1;
+}
 extern "C" int runtime_memory_read_backing(uintptr_t address,void* out,uint64_t size) {
     ++reads;
     if(address<0x1000 || address-0x1000>memory.size() || size>memory.size()-(address-0x1000)) return 0;
@@ -24,6 +29,22 @@ int main(int argc,char** argv) {
     Spec spec; spec.width=12; spec.stride=16; spec.samples=8; spec.count=195; spec.first=1456;
     for(unsigned i=0;i<96;++i) spec.positions[i]=static_cast<unsigned char>(i+1);
     Binding b{0x1000,memory.size(),16,0,12,106,0,0,true};
+    auto classify=b; classify.width=0;
+    assert(BbMeshSearch::Classify(spec,target,classify)==BbMeshSearch::Rejection::Format);
+    classify=b; classify.width=6;
+    assert(BbMeshSearch::Classify(spec,target,classify)==BbMeshSearch::Rejection::Width);
+    classify=b; classify.per_vertex=false;
+    assert(BbMeshSearch::Classify(spec,target,classify)==BbMeshSearch::Rejection::Instance);
+    classify=b; classify.stride=4;
+    assert(BbMeshSearch::Classify(spec,target,classify)==BbMeshSearch::Rejection::Stride);
+    BbMeshSearch::Layouts layouts;
+    for(unsigned i=0;i<20;++i) layouts.Add(b,BbMeshSearch::Rejection::Shape,false);
+    uint64_t tracked=0; for(const auto& row:layouts.rows) tracked+=row.count;
+    assert(tracked==20 && !layouts.overflow);
+    for(unsigned i=0;i<5000;++i) { auto unique=b; unique.size=i; layouts.Add(unique,BbMeshSearch::Rejection::Shape,true); }
+    tracked=0; for(const auto& row:layouts.rows) tracked+=row.count;
+    assert(layouts.observations==tracked+layouts.overflow && layouts.overflow>0);
+    layouts.Print(0);
     auto place=[&](uint64_t vertex) { for(unsigned i=0;i<spec.samples;++i) std::memcpy(memory.data()+(vertex+i)*b.stride+b.offset,spec.positions.data()+i*12,12); };
     // Crosses a chunk boundary and is not at the offline vertex offset.
     place(4093);
@@ -102,6 +123,14 @@ int main(int argc,char** argv) {
             Binding deferred=b; deferred.address=0x19000;
             BbMeshSearch::Begin(false); BbMeshSearch::Observe(deferred);
             assert(BbMeshSearch::search.used==used && BbMeshSearch::search.budget_skipped);
+            // An actual copy-address candidate bypasses shape guessing, with fresh XYZ checks.
+            Binding copied{0x1a000,6400,16,0,12,106,0,0,true};
+            copy_prefix=copied.address+10*16;
+            for(unsigned k=0;k<8;++k) std::memcpy(memory.data()+copy_prefix-0x1000+k*16,spec.positions.data()+k*12,12);
+            BbMeshSearch::Begin(false); BbMeshSearch::Observe(copied);
+            assert(BbMeshSearch::search.copy_candidates==1 && BbMeshSearch::search.copy_hits==1);
+            assert(BbMeshSearch::search.hit_count==1);
+            copy_prefix=0;
         }
     } else assert(reads==before);
     std::filesystem::remove_all(root);
@@ -118,10 +147,12 @@ int main(int argc,char** argv) {
     hb.per_vertex=true; half.first=5;
     auto anchor=BbMeshSearch::Anchors(half,hb,1024,runtime_memory_read_backing);
     assert(anchor.found && anchor.vertex==5 && anchor.bytes==48);
+    assert(anchor.anchor_attempts==1 && !anchor.anchor_mismatch);
     for(unsigned i=0;i<8;++i) std::memcpy(memory.data()+i*8,half.positions.data()+i*6,6);
     half.first=100;
     anchor=BbMeshSearch::Anchors(half,hb,1024,runtime_memory_read_backing);
     assert(anchor.found && anchor.vertex==0);
+    assert(anchor.anchor_short==1 && anchor.anchor_attempts==1);
     before=reads; anchor=BbMeshSearch::Anchors(half,hb,5,runtime_memory_read_backing);
     assert(anchor.truncated && reads==before);
     puts("Mesh search: chunk boundaries, relocation/repacking, budgets, stale bytes, direct/indirect paths and TLS passed");

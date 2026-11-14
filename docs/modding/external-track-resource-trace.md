@@ -1,5 +1,8 @@
 # Road742: trace file reads and search actual vertex bindings
 
+Latest experiment: [layout rejection and observed copy tracing](external-track-layout-copy.md).
+The commands below enable its bounded diagnostics in a fresh experiment directory.
+
 Follow-up: the Windows run of `04fe187` verified headers but exhausted the broad
 search budget. See [targeted search findings](external-track-targeted-search.md).
 The launch commands below now prepare a v2 position-prefix trace and enable
@@ -164,7 +167,7 @@ Only use the original extracted stock RPK here. Generated RPK copies are private
 ```powershell
 $ErrorActionPreference='Stop'
 $Repo='H:\DC-Track-Test'
-$Run="$Repo\work\road742-targeted-search-$([guid]::NewGuid().ToString('N'))"
+$Run="$Repo\work\road742-layout-copy-$([guid]::NewGuid().ToString('N'))"
 $Input="$Run\inputs"
 python "$Repo\tools\track_import\prepare_resource_trace.py" `
   --dcmod "$Repo\out\dcmod.exe" `
@@ -191,9 +194,11 @@ try {
     Get-ChildItem Env:BB_* | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
     $env:BB_DMEM_MB='8056'
     $env:BB_RPK_TRACE_FILE="$Input\rpk-trace.txt"
+    $env:BB_RPK_COPY_TRACE='1'
     $env:BB_MESH_PROBE=(Get-Content -Raw "$Input\stock-probe.txt").Trim()
     $env:BB_MESH_SEARCH=$Trigger
     $env:BB_MESH_SEARCH_TARGET=(Get-Content -Raw "$Input\mesh-search-target.txt").Trim()
+    $env:BB_MESH_LAYOUTS='1'
     $env:BB_MESH_PROBE_CONTROL=$Trigger
     $env:BB_GPU_USER_DIR="$Run\user"
     $env:BB_CONFIG="$Run\user\driveclub.ini"
@@ -219,7 +224,7 @@ try {
     foreach($Name in $Saved.Keys) { Set-Item -LiteralPath "Env:$Name" -Value $Saved[$Name] }
     $env:VK_LOADER_LAYERS_DISABLE=$OldLayers
 }
-Select-String -Path "$Run\logs\*.log" -Pattern 'RpkTrace:','MeshSearch:','MeshProbe:','replaced by mods folder' |
+Select-String -Path "$Run\logs\*.log" -Pattern 'RpkTrace:','RpkCopy:','MeshSearch','MeshCopyBinding:','MeshLayouts:','MeshProbe:','replaced by mods folder' |
     Out-File "$Run\diagnostic-lines.txt"
 Write-Host "Evidence directory: $Run"
 ```
