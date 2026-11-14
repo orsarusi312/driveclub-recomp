@@ -1,6 +1,6 @@
 # Road742: trace file reads and search actual vertex bindings
 
-Latest experiment: [layout rejection and observed copy tracing](external-track-layout-copy.md).
+Latest experiment: [observed layouts and stale copy sources](external-track-observed-layouts.md).
 The commands below enable its bounded diagnostics in a fresh experiment directory.
 
 Follow-up: the Windows run of `04fe187` verified headers but exhausted the broad
@@ -163,17 +163,20 @@ modification. It leaves the original source, prepared binaries, previous experim
 and working executable untouched. `prepare_resource_trace.py` rejects an existing
 output directory, checks source headers/spans, and verifies source/copy SHA256.
 Only use the original extracted stock RPK here. Generated RPK copies are private.
+The dependency paths below match the latest supplied scan. If your originals are
+still under `work/dependencies`, change only those two input paths; do not move or
+overwrite existing files. Select **Forward**, never Reverse, for this manifest.
 
 ```powershell
 $ErrorActionPreference='Stop'
 $Repo='H:\DC-Track-Test'
-$Run="$Repo\work\road742-layout-copy-$([guid]::NewGuid().ToString('N'))"
+$Run="$Repo\work\road742-observed-layouts-$([guid]::NewGuid().ToString('N'))"
 $Input="$Run\inputs"
 python "$Repo\tools\track_import\prepare_resource_trace.py" `
   --dcmod "$Repo\out\dcmod.exe" `
   --source "$Repo\work\visual-recovery\worlds\canada_road_circuit_02_n.rpk" `
-  --dependency "$Repo\work\dependencies\global.rpk" `
-  --dependency "$Repo\work\dependencies\worlds\canada_common.rpk" `
+  --dependency "$Repo\work\visual-recovery\global.rpk" `
+  --dependency "$Repo\work\visual-recovery\worlds\canada_common.rpk" `
   --target '000862187dac760f_0_polyRoadShape742' --output $Input
 if($LASTEXITCODE -ne 0) { throw 'Preparation failed; do not launch this folder' }
 $RuntimeDir=Read-Host 'Working runtime folder containing the runtime DLLs'
@@ -199,6 +202,7 @@ try {
     $env:BB_MESH_SEARCH=$Trigger
     $env:BB_MESH_SEARCH_TARGET=(Get-Content -Raw "$Input\mesh-search-target.txt").Trim()
     $env:BB_MESH_LAYOUTS='1'
+    $env:BB_MESH_SEARCH_ALLOW='l1:37334/44,37449/44,52376/28,51386/16,18057/44'
     $env:BB_MESH_PROBE_CONTROL=$Trigger
     $env:BB_GPU_USER_DIR="$Run\user"
     $env:BB_CONFIG="$Run\user\driveclub.ini"
@@ -273,8 +277,9 @@ Verified in this workspace:
 
 The full Vulkan runtime cannot be compiled in this workspace: CMake and the GPU
 build dependencies are unavailable. The rasterizer integration therefore requires
-the Windows rebuild above. The new file/buffer trace has **not** been validated
-against the user's game, and a synthetic matching test is not gameplay evidence.
+the Windows rebuild above. Earlier file/buffer diagnostics have Windows evidence described in the follow-up
+reports. The latest allowlist and source-retirement changes still require a Windows
+run; a synthetic matching test is not gameplay evidence.
 
 Modified implementation files: `gpu/shim/bbport_mesh_search.h`,
 `gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp`,

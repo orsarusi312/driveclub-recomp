@@ -20,12 +20,32 @@ static std::string hex(const unsigned char* p,size_t n) {
     std::string s; for(size_t i=0;i<n;++i) { s+="0123456789abcdef"[p[i]>>4]; s+="0123456789abcdef"[p[i]&15]; } return s;
 }
 int main(int argc,char** argv) {
-    const bool targeted=argc==2 && !std::strcmp(argv[1],"--targeted");
+    const bool invalid_allow=argc==2 && !std::strcmp(argv[1],"--invalid-allow");
+    const bool no_target=argc==2 && !std::strcmp(argv[1],"--allow-no-target");
+    const bool targeted=invalid_allow || (argc==2 && !std::strcmp(argv[1],"--targeted"));
     BbMeshSearch::Target target;
     assert(BbMeshSearch::ParseTarget("t1:0003000000000001:35189:47",target));
     for(const auto* bad : {"", "t1:0004000000000001:35189:47", "t1:3:12:8", "t1:0003000000000001:0:0",
                           "t1:0003000000000001:8:9", "t1:0003000000000001:999999999999:47", "t1:0003000000000001:9:8:1"})
         assert(!BbMeshSearch::ParseTarget(bad,target));
+    BbMeshSearch::AllowedLayouts allowed;
+    const char* allow="l1:37334/44,37449/44,52376/28,51386/16,18057/44";
+    assert(BbMeshSearch::ParseAllowed(allow,allowed) && allowed.count==5);
+    for(const auto* bad : {"", "l1:", "l1:1/12,", "l1:1/12,1/12", "l1:999999999999/12",
+         "l1:200000/44", "l1:1/11", "l1:1/4097", "l1:0/12", "l1:1/12x", "l1:1//12",
+         "l1:1/12,2/12,3/12,4/12,5/12,6/12,7/12,8/12,9/12"})
+        assert(!BbMeshSearch::ParseAllowed(bad,allowed));
+    Binding observed{0x1000,37334*44,44,0,12,106,0,4,true};
+    assert(BbMeshSearch::Allowed(allowed,observed));
+    for(unsigned i=0;i<5;++i) {
+        auto bad=observed;
+        if(i==0) bad.width=6;
+        if(i==1) bad.format=97;
+        if(i==2) bad.per_vertex=false;
+        if(i==3) bad.offset=40;
+        if(i==4) ++bad.size;
+        assert(!BbMeshSearch::Allowed(allowed,bad));
+    }
     Spec spec; spec.width=12; spec.stride=16; spec.samples=8; spec.count=195; spec.first=1456;
     for(unsigned i=0;i<96;++i) spec.positions[i]=static_cast<unsigned char>(i+1);
     Binding b{0x1000,memory.size(),16,0,12,106,0,0,true};
@@ -80,12 +100,20 @@ int main(int argc,char** argv) {
     assert(std::filesystem::create_directory(root)); auto trigger=(root/"arm").string();
 #ifdef _WIN32
     _putenv_s("BB_MESH_PROBE",signature.c_str()); _putenv_s("BB_MESH_SEARCH",trigger.c_str());
+    if(targeted || no_target) _putenv_s("BB_MESH_SEARCH_ALLOW",invalid_allow ? "l1:bad":allow);
     _putenv_s("BB_MESH_SEARCH_TARGET",targeted ? "t1:0003000000000001:85:8":"");
 #else
     setenv("BB_MESH_PROBE",signature.c_str(),1); setenv("BB_MESH_SEARCH",trigger.c_str(),1);
+    if(targeted || no_target) setenv("BB_MESH_SEARCH_ALLOW",invalid_allow ? "l1:bad":allow,1); else unsetenv("BB_MESH_SEARCH_ALLOW");
     if(targeted) setenv("BB_MESH_SEARCH_TARGET","t1:0003000000000001:85:8",1); else unsetenv("BB_MESH_SEARCH_TARGET");
 #endif
     before=reads; BbMeshSearch::Begin(false); BbMeshSearch::Observe(b); assert(reads==before);
+    if(invalid_allow || no_target) {
+        assert(!BbMeshSearch::Trigger() && reads==before);
+        std::filesystem::remove_all(root);
+        puts("Mesh search: malformed allowlist/missing target disables search without broad fallback");
+        return 0;
+    }
     FILE* flag=std::fopen(trigger.c_str(),"wb"); assert(flag); std::fclose(flag);
     BbMeshSearch::search.poll-=std::chrono::seconds(2);
     // Search is independent of donor index count, and works for indirect bindings too.
@@ -110,6 +138,21 @@ int main(int argc,char** argv) {
         BbMeshSearch::Begin(false); BbMeshSearch::Observe(b); BbMeshSearch::Recorded(1,2,3); assert(reads==before);
         std::thread worker([] { assert(BbMeshSearch::search.used==0 && !BbMeshSearch::search.armed); }); worker.join();
         if(targeted) {
+            // Observed larger layout admitted through the real Observe path; noncanonical
+            // location, changed stride, attribute offset and indirect binding all covered.
+            std::fill(memory.begin(),memory.end(),0);
+            for(unsigned k=0;k<8;++k) std::memcpy(memory.data()+(30001+k)*44+4,spec.positions.data()+k*12,12);
+            assert(!BbMeshSearch::Shape(BbMeshSearch::Targeting(),observed));
+            BbMeshSearch::Begin(true); BbMeshSearch::Observe(observed);
+            assert(BbMeshSearch::search.allowed_scans==1 && BbMeshSearch::search.allowed_complete==1);
+            assert(BbMeshSearch::search.allowed_bytes>0 && BbMeshSearch::search.hit_count==1);
+            assert(BbMeshSearch::search.hits[0].result.vertex==30001);
+            // A complete negative scan is also charged, and cached without repeated reads.
+            auto negative=observed; negative.size=37449*44;
+            std::fill(memory.begin(),memory.end(),0);
+            BbMeshSearch::Begin(false); BbMeshSearch::Observe(negative);
+            assert(BbMeshSearch::search.allowed_complete==2 && BbMeshSearch::search.hit_count==0);
+            before=reads; BbMeshSearch::Begin(false); BbMeshSearch::Observe(negative); assert(reads==before);
             const auto scan_bytes=BbMeshSearch::search.bytes;
             const auto anchor_bytes=BbMeshSearch::search.anchor_bytes;
             for(unsigned i=0;i<100;++i) {

@@ -14,4 +14,6 @@ for mode in 0 1; do
     "$cxx" -std=c++17 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/mesh_search_test.cpp -o out/tests/mesh-search-$mode.exe
     out/tests/mesh-search-$mode.exe
     out/tests/mesh-search-$mode.exe --targeted
+    out/tests/mesh-search-$mode.exe --invalid-allow
+    out/tests/mesh-search-$mode.exe --allow-no-target
 done

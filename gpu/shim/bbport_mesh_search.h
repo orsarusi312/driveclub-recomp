@@ -36,6 +36,58 @@ inline bool Shape(const Target& t,const Binding& b) {
     const uint64_t n=Vertices(b);
     return n==t.native_vertices || n==t.slot_vertices;
 }
+// Explicit observed layouts only; malformed configuration disables search, never broadens it.
+struct AllowedLayouts {
+    struct Pair { uint32_t records=0, stride=0; };
+    std::array<Pair,8> pairs{}; unsigned count=0; bool requested=false, valid=false;
+};
+inline bool ParseAllowed(std::string_view text,AllowedLayouts& out) {
+    if(text.size()>256 || text.substr(0,3)!="l1:") return false;
+    text.remove_prefix(3); AllowedLayouts value;
+    while(!text.empty()) {
+        if(value.count==value.pairs.size()) return false;
+        auto& pair=value.pairs[value.count];
+        const auto slash=text.find('/');
+        if(slash==std::string_view::npos || !slash) return false;
+        auto r=std::from_chars(text.data(),text.data()+slash,pair.records);
+        if(r.ec!=std::errc{} || r.ptr!=text.data()+slash) return false;
+        text.remove_prefix(slash+1);
+        const auto comma=text.find(','); const auto end=comma==std::string_view::npos ? text.size():comma;
+        r=std::from_chars(text.data(),text.data()+end,pair.stride);
+        if(!end || r.ec!=std::errc{} || r.ptr!=text.data()+end || !pair.records ||
+           pair.stride<12 || pair.stride>4096 || uint64_t(pair.records)*pair.stride>BindingLimit) return false;
+        for(unsigned i=0;i<value.count;++i)
+            if(value.pairs[i].records==pair.records && value.pairs[i].stride==pair.stride) return false;
+        ++value.count;
+        if(comma==std::string_view::npos) break;
+        text.remove_prefix(comma+1); if(text.empty()) return false;
+    }
+    if(!value.count) return false;
+    value.requested=value.valid=true; out=value; return true;
+}
+inline const AllowedLayouts& Allowing() {
+    static const AllowedLayouts value=[] {
+        AllowedLayouts a;
+        if(const char* p=BB_DIAGNOSTIC_ENV("BB_MESH_SEARCH_ALLOW")) {
+            a.requested=true;
+            if(!ParseAllowed(p,a)) std::fputs("MeshSearch: invalid layout allowlist; search disabled\n",stderr);
+        }
+        return a;
+    }(); return value;
+}
+inline bool Allowed(const AllowedLayouts& a,const Binding& b) {
+    // Format 106 is the observed supported float XYZ encoding. Require whole records,
+    // including the attribute offset, and preserve all existing range/rate checks.
+    if(!a.valid || !b.per_vertex || b.format!=106 || b.width!=12 || !b.stride ||
+       b.size>BindingLimit || b.size%b.stride || b.offset>b.stride || b.width>b.stride-b.offset ||
+       b.address>UINTPTR_MAX-b.size) return false;
+    for(unsigned i=0;i<a.count;++i)
+        if(b.size/b.stride==a.pairs[i].records && b.stride==a.pairs[i].stride) return true;
+    return false;
+}
+inline bool Eligible(const Target& t,const Binding& b) {
+    return !t.valid || Shape(t,b) || Allowed(Allowing(),b);
+}
 struct Result { bool found=false, truncated=false; uint64_t vertex=0, bytes=0, failures=0;
     unsigned anchor_attempts=0, anchor_short=0, anchor_mismatch=0, anchor_range=0; };
 // Cheap independent pool: native offset and isolated/repacked start, never numeric tolerance.
@@ -110,7 +162,7 @@ inline Rejection Classify(const Spec& spec,const Target& target,const Binding& b
     if(b.width!=spec.width) return Rejection::Width;
     if(b.stride<b.width || b.stride>4096) return Rejection::Stride;
     if(b.offset>b.size || b.size-b.offset<b.width || b.address>UINTPTR_MAX-b.size) return Rejection::Bounds;
-    if(target.valid && !Shape(target,b)) return Rejection::Shape;
+    if(!Eligible(target,b)) return Rejection::Shape;
     return Rejection::Eligible;
 }
 struct Layouts {
@@ -162,7 +214,7 @@ struct SearchState {
     uint64_t bytes=0, failures=0, truncated=0, unsupported=0, skips=0, full=0,
              direct=0, indirect=0, found=0, referenced=0, stale=0, no_supported_bindings=0,
              anchor_bytes=0, anchor_hits=0, shape_candidates=0, shape_skipped=0, scan_complete=0, budget_skipped=0,
-             anchor_attempts=0, anchor_short=0, anchor_mismatch=0, anchor_range=0, copy_candidates=0, copy_hits=0;
+             anchor_attempts=0, anchor_short=0, anchor_mismatch=0, anchor_range=0, copy_candidates=0, copy_hits=0, allowed_scans=0, allowed_complete=0, allowed_bytes=0;
     bool armed=false, indirect_draw=false, budget_reported=false;
     std::chrono::steady_clock::time_point poll{}, last=std::chrono::steady_clock::now();
 };
@@ -171,11 +223,17 @@ inline const char* Trigger() {
     static const char* value=[] {
         const char* p=BB_DIAGNOSTIC_ENV("BB_MESH_SEARCH");
         if(!p || !*p) return static_cast<const char*>(nullptr);
+        if(Allowing().requested && !Allowing().valid) return static_cast<const char*>(nullptr);
+        if(Allowing().requested && !Targeting().valid) {
+            std::fputs("MeshSearch: layout allowlist requires a valid target; search disabled\n",stderr);
+            return static_cast<const char*>(nullptr);
+        }
         if(Targeting().requested && !Targeting().valid) return static_cast<const char*>(nullptr);
         if(!Configuration().offline) { std::fputs("MeshSearch: requires valid BB_MESH_PROBE signature; disabled\n",stderr); return static_cast<const char*>(nullptr); }
         std::fprintf(stderr,"MeshSearch: waiting for trigger file; mode=%s 64 MiB scan/lane, 2 MiB/binding, %u bindings, 4096 hit checks; target=%016llx native=%u slot=%u; targeted anchors have separate 2 MiB budget\n",
             Targeting().valid ? "targeted":"broad",Targeting().valid ? 4096u:1024u,
             (unsigned long long)Targeting().resource,Targeting().native_vertices,Targeting().slot_vertices);
+        if(Allowing().valid) std::fprintf(stderr,"MeshSearch: explicit layout allowlist enabled tuples=%u; same 64 MiB scan budget, supported float XYZ only\n",Allowing().count);
         return p;
     }();
     return value;
@@ -204,6 +262,8 @@ inline void Begin(bool indirect) {
             (unsigned long long)s.scan_complete,(unsigned long long)s.budget_skipped,
             (unsigned long long)s.anchor_attempts,(unsigned long long)s.anchor_short,
             (unsigned long long)s.anchor_mismatch,(unsigned long long)s.anchor_range);
+        if(Allowing().valid) std::fprintf(stderr,"MeshSearchAllow: lane=%u scans=%llu complete=%llu bytes=%llu; complete means readable search ended or found prefix, not full mesh identity\n",
+            state.lane,(unsigned long long)s.allowed_scans,(unsigned long long)s.allowed_complete,(unsigned long long)s.allowed_bytes);
         if(LayoutsOn()) s.layouts.Print(state.lane);
         if(Targeting().valid) std::fprintf(stderr,"MeshCopyBinding: lane=%u candidates=%llu fresh-matches=%llu; historical address candidates require fresh bytes\n",
             state.lane,(unsigned long long)s.copy_candidates,(unsigned long long)s.copy_hits);
@@ -257,7 +317,7 @@ inline void Observe(const Binding& b) {
             if(result.found && !copied) ++s.anchor_hits;
             if(result.truncated) { ++s.budget_skipped; return; }
         }
-        const bool eligible=!Targeting().valid || Shape(Targeting(),b);
+        const bool eligible=Eligible(Targeting(),b);
         if(!result.found && eligible) {
             const uint64_t window=uint64_t(spec.samples-1)*b.stride+b.width;
             if(ByteBudget-s.bytes<window) { ++s.budget_skipped; return; }
@@ -265,6 +325,10 @@ inline void Observe(const Binding& b) {
             result=Find(spec,b,ByteBudget-s.bytes,runtime_memory_read_backing);
             s.bytes+=result.bytes; s.failures+=result.failures; s.truncated+=result.truncated;
             if(!result.truncated && !result.failures) ++s.scan_complete;
+            if(Allowed(Allowing(),b)) {
+                ++s.allowed_scans; s.allowed_bytes+=result.bytes;
+                if(!result.truncated && !result.failures) ++s.allowed_complete;
+            }
         } else if(!eligible) ++s.shape_skipped;
         // A cached truncated result remains incomplete, never a completed negative scan.
         auto& added=s.cache[s.used++]; added.binding=b; added.result=result;
@@ -280,7 +344,7 @@ inline void Observe(const Binding& b) {
     if(entry->result.found && s.hit_count<s.hits.size()) {
         s.hits[s.hit_count]=*entry; s.hits[s.hit_count++].binding=b;
     }
-    if(Targeting().valid && Shape(Targeting(),b) && !entry->reported && s.candidate_logs<12 && s.candidate_count<s.candidates.size()) {
+    if(Targeting().valid && Eligible(Targeting(),b) && !entry->reported && s.candidate_logs<12 && s.candidate_count<s.candidates.size()) {
         entry->binding=b; s.candidates[s.candidate_count++]=entry;
     }
 }
@@ -294,11 +358,11 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uintptr_t args=0,uin
         auto& entry=*s.candidates[i]; if(entry.reported) continue;
         entry.reported=true; ++s.candidate_logs;
         const auto& b=entry.binding;
-        std::fprintf(stderr,"MeshSearchTarget: lane=%u shape-candidate path=%s vb=0x%llx bytes=%llu vertices=%llu stride=%u base-vertex=%d count=%u ib=0x%llx vs=%llx ps=%llx cached-prefix=%d scan-truncated=%d; shape only, not resource identity\n",
-            state.lane,s.indirect_draw ? "indirect-unchecked":"direct",(unsigned long long)b.address,
+        std::fprintf(stderr,"MeshSearchTarget: lane=%u shape-candidate path=%s admission=%s vb=0x%llx bytes=%llu vertices=%llu stride=%u base-vertex=%d count=%u ib=0x%llx vs=%llx ps=%llx cached-prefix=%d scan-truncated=%d scan-bytes=%llu scan-fail=%llu; shape only, not resource identity\n",
+            state.lane,s.indirect_draw ? "indirect-unchecked":"direct",Allowed(Allowing(),b) ? "observed-layout":"native-or-slot",(unsigned long long)b.address,
             (unsigned long long)b.size,(unsigned long long)Vertices(b),b.stride,int32_t(b.base_vertex),count,
             (unsigned long long)(state.bound ? state.index:0),(unsigned long long)vs,(unsigned long long)ps,
-            int(entry.result.found),int(entry.result.truncated));
+            int(entry.result.found),int(entry.result.truncated),(unsigned long long)entry.result.bytes,(unsigned long long)entry.result.failures);
     }
     for(unsigned i=0;i<s.hit_count && s.checks<4096;++i) {
         ++s.checks; const auto& hit=s.hits[i];
