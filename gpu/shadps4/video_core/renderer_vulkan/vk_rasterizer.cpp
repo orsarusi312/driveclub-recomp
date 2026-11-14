@@ -1,6 +1,7 @@
 #include "../../../shim/bbport_diagnostics.h"
 #include "../../../shim/bbport_mesh_probe.h"
 #include "../../../shim/bbport_mesh_search.h"
+#include "../../../shim/bbport_buffer_path.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -1355,6 +1356,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
+    const auto* path_ps=pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    BbBufferPath::Scope buffer_path(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
+                                   path_ps ? path_ps->pgm_hash : 0,false);
     buffer_cache.ApplyQueuedStores(); // bbport: guest stores emulated since the last recording
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
@@ -1633,6 +1637,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             cmdbuf.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, crumb_handle, 0, crumb);
         }
     });
+    buffer_path.Recorded(num_indices,num_instances,s32(first_vertex));
     {
         const auto* recent_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         BbRecent::Draw(vs_info.pgm_hash, recent_ps ? recent_ps->pgm_hash : 0, num_indices, num_instances);
@@ -1952,6 +1957,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     const IndirectDraw& indirect) {
+    const auto* path_ps=pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    BbBufferPath::Scope buffer_path(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
+                                   path_ps ? path_ps->pgm_hash : 0,true);
     if constexpr (BB_DIAGNOSTICS) {
         BbMeshProbe::Begin(false,0,true);
         BbMeshSearch::Begin(true);
@@ -1985,6 +1993,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         BindIndexBuffer();
     }
 
+    BbBufferPath::Add({BbBufferPath::Kind::IndirectArgs,indirect.args,uint64_t(stride)*max_count});
+    if(count_address) BbBufferPath::Add({BbBufferPath::Kind::IndirectCount,count_address,4});
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
@@ -2038,6 +2048,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             cmdbuf.drawIndirect(args, args_offset, max_count, stride);
         }
     });
+    buffer_path.Recorded(0,0,0);
     if constexpr (BB_DIAGNOSTICS) {
         const auto* ps=pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         BbMeshSearch::Recorded(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
@@ -2660,6 +2671,13 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
                                   regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
     }
 
+    if (BbBufferPath::Active()) {
+        for(size_t i=0;i<guest_buffers.size() && i<attributes.size() && i<bindings.size();++i) {
+            const auto& b=guest_buffers[i]; const auto& a=attributes[i];
+            BbBufferPath::Add({BbBufferPath::Kind::Vertex,b.base_address,b.GetSize(),0,a.offset,0,
+                a.location,b.GetStride(),u32(a.format),u32(bindings[i].inputRate)});
+        }
+    }
     if (bindings.empty()) {
         // If there are no bindings, there is nothing further to do.
         return;
@@ -2805,6 +2823,7 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    BbBufferPath::Add({BbBufferPath::Kind::Index,index_address,index_buffer_size,0,index_offset,0,0,index_size});
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
@@ -3003,6 +3022,8 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
+    BbBufferPath::Add({BbBufferPath::Kind::Shader,0,stage.buffers.size(),0,0,stage.pgm_hash,u32(stage.sw_stage),0,0,
+        u32(stage.has_fetch_shader) | (u32(stage.uses_dma)<<1)});
     const u64 alignment = instance.StorageMinAlignment();
     // bbport: the anti-aliasing pass's camera (NoteTaaBuffer) only feeds frame generation and DriveAA. Recognising
     // it reads every 416/512-byte constant buffer of slots 0 and 1, and from 1080p render the constant ring is in VRAM:
@@ -3025,6 +3046,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         const auto& desc = stage.buffers[buffer_index];
         const RingBinding* ring = num_ring_stages ? FindRingBinding(stage, buffer_index) : nullptr;
         if (ring) {
+            BbBufferPath::Add({BbBufferPath::Kind::Ring,0,ring->size,0,ring->offset,stage.pgm_hash,buffer_index});
             // Copied by the GPU command thread into the constant ring (read-only).
             if (!desc.IsSpecial()) {
                 // The copy the draw binds, made at decode: the guest memory may hold a later draw's values.
@@ -3040,6 +3062,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             }
             buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
         } else if (desc.IsSpecial()) {
+            BbBufferPath::Add({BbBufferPath::Kind::Special,0,0,0,0,stage.pgm_hash,buffer_index,0,u32(desc.buffer_type)});
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
@@ -3092,6 +3115,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         } else {
             const auto vsharp =
                 prepared ? prepared->buffer_sharps[buffer_index] : desc.GetSharp(stage);
+            BbBufferPath::Add({BbBufferPath::Kind::Resource,vsharp.base_address,vsharp.GetSize(),0,0,
+                stage.pgm_hash,buffer_index,vsharp.GetStride(),u32(desc.buffer_type),
+                u32(desc.is_written) | (u32(desc.is_formatted)<<1)});
             if (note_taa && vsharp.base_address != 0 && memory->IsValidGpuMapping(vsharp.base_address, 0)) {
                 NoteTaaBuffer(stage.pgm_hash, buffer_index, reinterpret_cast<const void*>(vsharp.base_address),
                               vsharp.GetSize());

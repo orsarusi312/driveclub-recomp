@@ -1,7 +1,7 @@
 # Road742: trace file reads and search actual vertex bindings
 
-Latest experiment: [observed layouts and stale copy sources](external-track-observed-layouts.md).
-The commands below enable its bounded diagnostics in a fresh experiment directory.
+Latest experiment: [shader-filtered buffer acquisition](external-track-buffer-path.md).
+Use that guide for the next run. The commands below retain the earlier observed-layout experiment.
 
 Follow-up: the Windows run of `04fe187` verified headers but exhausted the broad
 search budget. See [targeted search findings](external-track-targeted-search.md).

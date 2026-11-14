@@ -1,4 +1,5 @@
 #include "../../../shim/bbport_diagnostics.h"
+#include "../../../shim/bbport_buffer_path.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -1296,6 +1297,9 @@ bool BufferCache::IsHostWrittenBuffer(const Buffer* buffer) const noexcept {
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     BB_PIPE_CHECK("BufferCache::ObtainBuffer");
+    if (BbBufferPath::Active()) BbBufferPath::Add({BbBufferPath::Kind::Obtain,device_addr,size,0,0,0,0,0,0,
+        u32(is_written) | (u32(is_texel_buffer)<<1) | (u32(IsRegionGpuModified(device_addr,size))<<2) |
+        (u32(IsRegionCpuModified(device_addr,size))<<3)});
     BbStats::CheckCeConflict(device_addr, size, "a buffer binding");
     const bool stats = BufferStatsEnabled();
     if (stats) {
@@ -1322,12 +1326,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                     .size = size,
                     .extra = reinterpret_cast<u64>(static_cast<Buffer*>(&stream_buffer)),
                 });
+                BbBufferPath::Add({BbBufferPath::Kind::StreamQueued,device_addr,size,reinterpret_cast<uintptr_t>(&stream_buffer),*offset});
                 return {&stream_buffer, *offset};
             }
         }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
+        BbBufferPath::Add({BbBufferPath::Kind::StreamNow,device_addr,size,reinterpret_cast<uintptr_t>(&stream_buffer),offset});
         return {&stream_buffer, offset};
     }
     const u64 first_block = device_addr >> block_shift;
@@ -1348,6 +1354,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         gpu_byte_map.Mark(device_addr, size); // after SynchronizeMemory bumped the window's write sequence
         StampGpuWrite(device_addr, size);
     }
+    BbBufferPath::Add({BbBufferPath::Kind::Arena,device_addr,size,reinterpret_cast<uintptr_t>(arena),arena->Offset(device_addr)});
     return {arena, arena->Offset(device_addr)};
 }
 
@@ -1652,6 +1659,10 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
     }
     if constexpr (BB_DIAGNOSTICS) BbStats::buffer_upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
     const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+    if (BbBufferPath::Active()) for(const auto& copy : copies) {
+        BbBufferPath::Add({BbToggle::Disabled(BbToggle::DeferredUploads) ? BbBufferPath::Kind::UploadNow : BbBufferPath::Kind::UploadQueued,
+            copy.dstOffset,copy.size,reinterpret_cast<uintptr_t>(arena),copy.dstOffset-arena->cpu_addr});
+    }
     // bbport: the guest memory is copied into staging on the copy threads, started now in
     // groups of about 1 MiB; submission and guest-visible fences wait for them
     // (Scheduler::WaitHostCopies).
