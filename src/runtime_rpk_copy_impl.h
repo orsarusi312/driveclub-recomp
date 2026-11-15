@@ -62,6 +62,7 @@ static int rpk_copy_verify(uintptr_t address,unsigned *sample) {
     }
     return RPK_COPY_MATCH;
 }
+#include "runtime_rpk_request_impl.h"
 /* A failed old snapshot must not retire a newer independently verified read. */
 static int rpk_copy_release(unsigned slot,unsigned generation,int retire) {
     int retired=0,live=0;
@@ -131,7 +132,8 @@ static int rpk_copy_begin_impl(uintptr_t source,uintptr_t destination,uint64_t b
                 (unsigned long long)source,(unsigned long long)destination,(unsigned long long)bytes,retired);
             continue;
         }
-        *ticket=(RpkCopyTicket){at,destination+(at-source),bytes,p->id,1,source,destination,0};
+        *ticket=(RpkCopyTicket){.source=at,.destination=destination+(at-source),.bytes=bytes,.id=p->id,
+            .valid=1,.source_base=source,.destination_base=destination};
         return 1;
     }
     return 0;
@@ -180,7 +182,10 @@ int runtime_rpk_copy_begin(uintptr_t source,uintptr_t destination,uint64_t bytes
 #ifdef _WIN32
     const DWORD error=GetLastError();
 #endif
+    const RpkRequestTicket request=rpk_request_begin(source,destination,bytes);
     const int result=rpk_copy_begin_impl(source,destination,bytes,ticket);
+    ticket->request=request;
+    if(!result) ticket->caller=0;
 #ifdef _WIN32
     SetLastError(error);
 #endif
@@ -192,6 +197,8 @@ void runtime_rpk_copy_end(const RpkCopyTicket *ticket) {
     const DWORD error=GetLastError();
 #endif
     rpk_copy_end_impl(ticket);
+    const RpkRequestOps ops={rpk_debug_attached,rpk_request_pause};
+    rpk_request_end(&ticket->request,ticket->caller,&ops);
 #ifdef _WIN32
     SetLastError(error);
 #endif

@@ -96,6 +96,7 @@ static void rpk_trace_init(void) {
     rpk_debug_init();
     rpk_clear_init();
     rpk_read_watch_init();
+    rpk_request_init();
     fprintf(stderr,"RpkTrace: enabled path=%s resources=%u limit=64; file reads only, not native selection\n",
             rpk_trace_config.path,rpk_trace_config.count);
     const char *copy=BB_DIAGNOSTIC_ENV("BB_RPK_COPY_TRACE");
@@ -148,6 +149,7 @@ static void rpk_trace_note(const char *path,int64_t offset,uintptr_t buffer,int6
             (unsigned long long)at,(unsigned long long)length,(unsigned long long)address,header,method,prefix,(unsigned long long)prefix_address);
         const RpkTracePrefix *q=&rpk_trace_config.prefix;
         const RpkDebugRead debug_read={s.id,(uint64_t)offset,(uint64_t)bytes,buffer,prefix_address,q->stride,q->width,q->samples};
+        rpk_request_seed(&debug_read,header,prefix);
         rpk_read_watch_seed(&debug_read,header,prefix);
         rpk_clear_seed(&debug_read,header,prefix);
         rpk_debug_read_note(&debug_read,header,prefix); // Last prefix observation before returning to the read caller.

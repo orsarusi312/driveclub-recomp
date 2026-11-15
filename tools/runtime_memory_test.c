@@ -55,6 +55,14 @@ int main(void) {
     errno=EDOM;
     if(low_read_supported) assert(runtime_memory_debug_read((uintptr_t)low,metadata,14) && !strcmp(metadata,"native-vtable") && errno==EDOM);
     else assert(!runtime_memory_debug_read((uintptr_t)low,metadata,14) && errno==EDOM);
+    const char stack_bytes[]="stack-request";
+    char stack_copy[sizeof stack_bytes]={0}; errno=EDOM;
+    if(low_read_supported) assert(runtime_memory_debug_stack_read((uintptr_t)stack_bytes,stack_copy,sizeof stack_bytes) && !memcmp(stack_copy,stack_bytes,sizeof stack_bytes) && errno==EDOM);
+    else assert(!runtime_memory_debug_stack_read((uintptr_t)stack_bytes,stack_copy,sizeof stack_bytes));
+    assert(!runtime_memory_debug_stack_read((uintptr_t)low,stack_copy,8)); // not this thread's stack
+    assert(!runtime_memory_debug_stack_read((uintptr_t)stack_bytes,stack_copy,129));
+    assert(!runtime_memory_debug_stack_read(UINTPTR_MAX-1,stack_copy,8));
+    assert(!runtime_memory_debug_stack_read((uintptr_t)stack_bytes,NULL,8));
     assert(!runtime_memory_read_backing((uintptr_t)low,metadata,14)); // separate mapping domain
     assert(!runtime_memory_debug_read((uintptr_t)low,NULL,8));
     assert(!runtime_memory_debug_read((uintptr_t)low,metadata,4097));

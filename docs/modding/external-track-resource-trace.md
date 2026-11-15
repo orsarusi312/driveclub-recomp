@@ -1,4 +1,6 @@
-> Latest experiment: [bracket refills and verify selected-read copies](external-track-refill-provenance.md).
+> Latest experiment: [identify the initial request caller](external-track-request-caller.md).
+
+> Previous experiment: [bracket refills and verify selected-read copies](external-track-refill-provenance.md).
 
 > Previous experiment: [second-read buffered consumer boundary](external-track-reader-consumer.md).
 
@@ -6,8 +8,8 @@
 
 # Road742: trace file reads and search actual vertex bindings
 
-Latest experiment: [verified read boundary and debugger watchpoints](external-track-read-boundary.md).
-Use that guide for the next run. The commands below retain the earlier observed-layout experiment.
+Historical experiment: [verified read boundary and debugger watchpoints](external-track-read-boundary.md).
+Use the latest experiment linked above for the next run. The commands below retain the earlier observed-layout experiment.
 
 Follow-up: the Windows run of `04fe187` verified headers but exhausted the broad
 search budget. See [targeted search findings](external-track-targeted-search.md).

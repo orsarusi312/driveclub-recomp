@@ -74,3 +74,5 @@ int main(void) {
     memory[32]=0x22; assert(rpk_read_watch_end(&t,256,"/app0/test.rpk",384));
     puts("Read watch: ordinal, read ranges, partial/padding, aliases, remap, stale/unreadable, actual counts, errors, bounded reads and publication passed");
 }
+
+int runtime_memory_debug_stack_read(uintptr_t a,void *out,uint64_t n) { (void)a; (void)out; (void)n; return 0; }

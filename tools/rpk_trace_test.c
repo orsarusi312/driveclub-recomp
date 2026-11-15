@@ -75,3 +75,5 @@ int main(void) {
 }
 
 int runtime_memory_debug_read(uintptr_t address,void *out,uint64_t bytes) { return runtime_memory_read_backing(address,out,bytes); }
+
+int runtime_memory_debug_stack_read(uintptr_t a,void *out,uint64_t n) { (void)a; (void)out; (void)n; return 0; }

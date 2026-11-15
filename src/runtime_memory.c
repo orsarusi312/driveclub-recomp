@@ -1013,14 +1013,8 @@ uintptr_t runtime_memory_debug_backing_address(uintptr_t address,uint64_t size) 
 }
 /* Diagnostic-only bounded metadata read. Low native image/stack mappings are not
  * pool VMAs. Use an OS-checked read there, never a raw-pointer fallback. */
-int runtime_memory_debug_read(uintptr_t address,void *data,uint64_t size) {
-    if(!data || !size || size>4096 || size>UINTPTR_MAX-address) return 0;
-    const int saved_errno=errno;
+static int debug_host_read(uintptr_t address,void *data,uint64_t size) {
     int ok=0;
-#ifdef _WIN32
-    const DWORD saved_error=GetLastError();
-#endif
-    if(address>=LOW_MIN && address<USER_MIN && size<=USER_MIN-address) {
 #ifdef _WIN32
         uintptr_t at=address, end=address+size;
         while(at<end) {
@@ -1038,14 +1032,47 @@ int runtime_memory_debug_read(uintptr_t address,void *data,uint64_t size) {
         struct iovec local={data,(size_t)size}, remote={(void *)address,(size_t)size};
         ok=process_vm_readv(getpid(),&local,1,&remote,1,0)==(ssize_t)size;
 #endif
-    } else if(address>=USER_MIN && address<USER_MAX && size<=USER_MAX-address) {
-        ok=backing_copy(address,data,size,0);
-    }
+    return ok;
+}
+int runtime_memory_debug_read(uintptr_t address,void *data,uint64_t size) {
+    if(!data || !size || size>4096 || size>UINTPTR_MAX-address) return 0;
+    const int saved_errno=errno;
+    int ok=0;
+#ifdef _WIN32
+    const DWORD saved_error=GetLastError();
+#endif
+    if(address>=LOW_MIN && address<USER_MIN && size<=USER_MIN-address) ok=debug_host_read(address,data,size);
+    else if(address>=USER_MIN && address<USER_MAX && size<=USER_MAX-address) ok=backing_copy(address,data,size,0);
 #ifdef _WIN32
     SetLastError(saved_error);
 #endif
-    errno=saved_errno;
-    return ok;
+    errno=saved_errno; return ok;
+}
+/* Small copy destinations may be on this native thread's stack below LOW_MIN.
+ * Keep this API separate: it cannot inspect other threads or arbitrary host heaps. */
+int runtime_memory_debug_stack_read(uintptr_t address,void *data,uint64_t size) {
+    if(!data || !size || size>128 || size>UINTPTR_MAX-address) return 0;
+    const int saved_errno=errno;
+    uintptr_t low=0,high=0;
+#ifdef _WIN32
+    const DWORD saved_error=GetLastError();
+    ULONG_PTR bottom=0,top=0;
+    GetCurrentThreadStackLimits(&bottom,&top); low=(uintptr_t)bottom; high=(uintptr_t)top;
+#else
+    pthread_attr_t attr;
+    if(!pthread_getattr_np(pthread_self(),&attr)) {
+        void *base=NULL; size_t bytes=0;
+        if(!pthread_attr_getstack(&attr,&base,&bytes) && bytes<=UINTPTR_MAX-(uintptr_t)base) {
+            low=(uintptr_t)base; high=low+bytes;
+        }
+        pthread_attr_destroy(&attr);
+    }
+#endif
+    const int ok=low && address>=low && address<high && size<=high-address && debug_host_read(address,data,size);
+#ifdef _WIN32
+    SetLastError(saved_error);
+#endif
+    errno=saved_errno; return ok;
 }
 /* Writes through the backing view; 0 when part of the range has no backing. */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) { return backing_copy(address,(void *)data,size,1); }

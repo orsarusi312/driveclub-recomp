@@ -42,6 +42,8 @@ void runtime_memory_diagnose(uintptr_t address);
 uintptr_t runtime_memory_debug_backing_address(uintptr_t address, uint64_t size);
 /* Bounded diagnostic metadata only: pool alias or OS-checked native low mapping. */
 int runtime_memory_debug_read(uintptr_t address, void *data, uint64_t size);
+/* At most 128 bytes, restricted to the calling thread stack, OS checked. */
+int runtime_memory_debug_stack_read(uintptr_t address, void *data, uint64_t size);
 uint64_t runtime_memory_direct_size(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 const char *runtime_import_name(const char *name);
