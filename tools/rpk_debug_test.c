@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "../src/runtime_rpk_debug.h"
 #include <assert.h>
+int runtime_memory_read_backing(uintptr_t address,void *out,uint64_t bytes) { (void)address; (void)out; (void)bytes; assert(0); return 0; }
 #ifdef _WIN32
 /* No real mappings or debugger break are used by the standalone observer tests. */
 uintptr_t runtime_memory_debug_backing_address(uintptr_t address,uint64_t size) { (void)address; (void)size; return 0; }

@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include "runtime_rpk_reader.h"
+extern int runtime_memory_read_backing(uintptr_t,void *,uint64_t);
 #ifdef _WIN32
 #include <windows.h>
 extern uintptr_t runtime_memory_debug_backing_address(uintptr_t,uint64_t);
@@ -51,6 +53,7 @@ static inline int rpk_debug_attached(void) {
 }
 static inline void rpk_debug_pause(const RpkDebugRead *read) {
 #ifdef _WIN32
+    rpk_reader_note(read->resource,read->read_base,read->read_bytes,runtime_memory_read_backing);
     const uintptr_t backing=runtime_memory_debug_backing_address(read->prefix,1);
     char line[320];
     snprintf(line,sizeof line,"RpkDebugRead: WATCH resource=%016llx guest=0x%llx backing=0x%llx; BEFORE read returns. One-byte hardware watchpoints on available distinct aliases; no symbols required.\n",
@@ -66,6 +69,7 @@ static inline void rpk_debug_pause(const RpkDebugRead *read) {
 static RpkDebugState rpk_debug_state;
 static inline void rpk_debug_init(void) {
     if(!BB_DIAGNOSTICS) return;
+    rpk_reader_init();
     const char *setting=BB_DIAGNOSTIC_ENV("BB_RPK_DEBUG_READ");
     rpk_debug_state.target=rpk_debug_target(setting);
 #ifndef _WIN32

@@ -1,3 +1,5 @@
+> Latest experiment: [second-read buffered consumer boundary](external-track-reader-consumer.md).
+
 > Latest experiment: [inspect the native caller before the verified read buffer is cleared](external-track-before-clear.md).
 
 # Road742: trace file reads and search actual vertex bindings
