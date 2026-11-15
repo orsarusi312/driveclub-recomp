@@ -1,4 +1,6 @@
-> Latest experiment: [identify the initial request caller](external-track-request-caller.md).
+> Latest experiment: [offline request-caller and resource-span inspection](external-track-native-caller-static.md).
+
+> Previous experiment: [identify the initial request caller](external-track-request-caller.md).
 
 > Previous experiment: [bracket refills and verify selected-read copies](external-track-refill-provenance.md).
 

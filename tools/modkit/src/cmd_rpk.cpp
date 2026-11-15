@@ -22,6 +22,7 @@ int Usage() {
         "\n"
         "  dcmod rpk info PACK                     header, counts per type, required packs\n"
         "  dcmod rpk list PACK [PATTERN...] [-l]   the resources (-l adds identifiers, sizes and source paths)\n"
+        "  dcmod rpk locate PACK OFFSET           JSON metadata for the payload containing a file offset\n"
         "  dcmod rpk extract PACK -o DIR [PATTERN...]  write the resources and a pack.json that describes them\n"
         "  dcmod rpk build DIR -o PACK             put an extracted folder back together\n"
         "  dcmod rpk replace PACK TARGET FILE -o OUT  change one resource to the content of FILE\n"
@@ -321,6 +322,39 @@ int RunRpk(const std::vector<std::string>& argv) {
     if (cmd == "build") return Build(args, args.positional[1]);
     if (cmd == "replace") return Replace(args);
     if (cmd == "verify") return Verify(args);
+    if (cmd == "locate") {
+        if (args.positional.size() != 3) throw Error("locate needs PACK and decimal or 0x-prefixed OFFSET");
+        const std::string text = args.positional[2];
+        const bool hex = StartsWith(text, "0x");
+        const std::string digits = hex ? text.substr(2) : text;
+        if (digits.empty() || digits.find_first_not_of(hex ? "0123456789abcdefABCDEF" : "0123456789") != std::string::npos)
+            throw Error("invalid file offset");
+        uint64_t offset;
+        try { offset = std::stoull(digits, nullptr, hex ? 16 : 10); }
+        catch (const std::exception&) { throw Error("file offset out of range"); }
+        const RpkPack pack = LoadPack(args, args.positional[1]);
+        Json report = Json::Object();
+        report.Set("schema", "dcmod-rpk-location-v1");
+        report.Set("file_offset", std::to_string(offset));
+        report.Set("scope", "parsed payload span only; no native selection or consumption claim");
+        report.Set("resource", Json());
+        for (const RpkResource& r : pack.resources) {
+            if (offset < r.source_offset || offset - r.source_offset >= r.data.size()) continue;
+            Json row = Json::Object();
+            row.Set("id", HexId(r.id)); row.Set("type", RpkTypeName(r.Type()));
+            row.Set("offset", size_t(r.source_offset)); row.Set("size", r.data.size());
+            row.Set("offset_within_payload", size_t(offset-r.source_offset));
+            const bool header = r.data.size() >= 20 && !std::memcmp(r.data.data(), "EVOSLITL", 8);
+            row.Set("header_magic_valid", header);
+            row.Set("payload_id", header ? Json(HexId(r.PayloadId())) : Json());
+            row.Set("payload_id_matches_toc", header && r.PayloadId() == r.id);
+            row.Set("version", header ? Json(r.PayloadVersion()) : Json());
+            report.Set("resource", row);
+            break;
+        }
+        std::puts(report.Dump().c_str());
+        return 0;
+    }
     if (cmd == "info" || cmd == "list") {
         const RpkPack pack = LoadPack(args, args.positional[1]);
         if (cmd == "list") {
