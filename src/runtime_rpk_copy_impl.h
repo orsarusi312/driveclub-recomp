@@ -10,6 +10,7 @@ static unsigned rpk_copy_count,rpk_copy_active,rpk_copy_calls,rpk_copy_logs,rpk_
 static unsigned rpk_copy_ready,rpk_copy_queries,rpk_copy_partial,rpk_copy_retired,rpk_copy_generation;
 static int rpk_copy_catalog_full;
 static int rpk_copy_enabled;
+static unsigned rpk_copy_read_target,rpk_copy_read_seen;
 static void rpk_copy_seed(uintptr_t address) {
     if (!rpk_copy_enabled || __atomic_load_n(&rpk_copy_calls,__ATOMIC_RELAXED)>=RPK_COPY_CALL_LIMIT ||
         __atomic_load_n(&rpk_copy_logs,__ATOMIC_RELAXED)>=64) return;
@@ -33,6 +34,15 @@ static void rpk_copy_seed(uintptr_t address) {
     pthread_mutex_unlock(&rpk_copy_lock);
     if(retained) fprintf(stderr,"RpkCopy: seeded verified prefix=0x%llx generation=%u; metadata only, allocation lifetime unknown\n",(unsigned long long)address,generation);
     if(full) fputs("RpkCopy: address catalog full (16); further verified destinations are logged but not retained\n",stderr);
+}
+/* Optional read ordinal narrows initial seeds; verified copy destinations still chain. */
+static void rpk_copy_read_seed(uintptr_t address,const char *header,const char *prefix) {
+    if(!rpk_copy_enabled || strcmp(prefix,"verified")) return;
+    if(rpk_copy_read_target) {
+        if(strcmp(header,"verified") || __atomic_load_n(&rpk_copy_read_seen,__ATOMIC_RELAXED)>=rpk_copy_read_target) return;
+        if(__atomic_fetch_add(&rpk_copy_read_seen,1,__ATOMIC_RELAXED)+1!=rpk_copy_read_target) return;
+    } else if(strcmp(header,"verified") && strcmp(header,"partial")) return;
+    rpk_copy_seed(address);
 }
 enum { RPK_COPY_MATCH, RPK_COPY_MISMATCH, RPK_COPY_UNREADABLE, RPK_COPY_BOUNDS };
 static const char *rpk_copy_reason(int result) {
@@ -67,7 +77,7 @@ static int rpk_copy_release(unsigned slot,unsigned generation,int retire) {
     if(retired) __atomic_fetch_add(&rpk_copy_retired,1,__ATOMIC_RELAXED);
     return retired;
 }
-int runtime_rpk_copy_begin(uintptr_t source,uintptr_t destination,uint64_t bytes,RpkCopyTicket *ticket) {
+static int rpk_copy_begin_impl(uintptr_t source,uintptr_t destination,uint64_t bytes,RpkCopyTicket *ticket) {
     ticket->valid=0;
     if(!__atomic_load_n(&rpk_copy_active,__ATOMIC_ACQUIRE)) return 0;
     const unsigned call=__atomic_fetch_add(&rpk_copy_calls,1,__ATOMIC_RELAXED);
@@ -121,19 +131,25 @@ int runtime_rpk_copy_begin(uintptr_t source,uintptr_t destination,uint64_t bytes
                 (unsigned long long)source,(unsigned long long)destination,(unsigned long long)bytes,retired);
             continue;
         }
-        *ticket=(RpkCopyTicket){at,destination+(at-source),bytes,p->id,1};
+        *ticket=(RpkCopyTicket){at,destination+(at-source),bytes,p->id,1,source,destination,0};
         return 1;
     }
     return 0;
 }
-void runtime_rpk_copy_end(const RpkCopyTicket *ticket) {
+static void rpk_copy_end_impl(const RpkCopyTicket *ticket) {
     if(!ticket->valid) return;
     unsigned sample=0;
     const int result=rpk_copy_verify(ticket->destination,&sample);
     const int match=result==RPK_COPY_MATCH;
-    fprintf(stderr,"RpkCopy: id=%016llx source-prefix=0x%llx destination-prefix=0x%llx copy-bytes=%llu destination=%s; observed HLE copy, not rendering\n",
+    fprintf(stderr,"RpkCopy: id=%016llx source-prefix=0x%llx destination-prefix=0x%llx copy-bytes=%llu destination=%s source-before=verified source-base=0x%llx destination-base=0x%llx caller=0x%llx; verified samples only, not whole-resource ownership or rendering",
         (unsigned long long)ticket->id,(unsigned long long)ticket->source,(unsigned long long)ticket->destination,
-        (unsigned long long)ticket->bytes,rpk_copy_reason(result));
+        (unsigned long long)ticket->bytes,rpk_copy_reason(result),(unsigned long long)ticket->source_base,
+        (unsigned long long)ticket->destination_base,(unsigned long long)ticket->caller);
+    if(match) {
+        fputs(" matched-prefix-first=",stderr);
+        for(uint64_t i=0;i<rpk_trace_config.prefix.width;++i) fprintf(stderr,"%02x",rpk_trace_config.prefix.bytes[i]);
+    }
+    fputc('\n',stderr);
     if(match) rpk_copy_seed(ticket->destination);
 }
 int runtime_rpk_copy_find(uintptr_t address,uint64_t bytes,uintptr_t *prefix,uint64_t *id) {
@@ -156,4 +172,28 @@ int runtime_rpk_copy_find(uintptr_t address,uint64_t bytes,uintptr_t *prefix,uin
     }
     pthread_mutex_unlock(&rpk_copy_lock);
     return found; // Historical metadata only: caller MUST freshly validate the bytes.
+}
+
+/* These observers must not change errno/LastError seen by the existing copy path. */
+int runtime_rpk_copy_begin(uintptr_t source,uintptr_t destination,uint64_t bytes,RpkCopyTicket *ticket) {
+    const int saved=errno;
+#ifdef _WIN32
+    const DWORD error=GetLastError();
+#endif
+    const int result=rpk_copy_begin_impl(source,destination,bytes,ticket);
+#ifdef _WIN32
+    SetLastError(error);
+#endif
+    errno=saved; return result;
+}
+void runtime_rpk_copy_end(const RpkCopyTicket *ticket) {
+    const int saved=errno;
+#ifdef _WIN32
+    const DWORD error=GetLastError();
+#endif
+    rpk_copy_end_impl(ticket);
+#ifdef _WIN32
+    SetLastError(error);
+#endif
+    errno=saved;
 }

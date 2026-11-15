@@ -21,6 +21,7 @@
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
@@ -1009,6 +1010,42 @@ uintptr_t runtime_memory_debug_backing_address(uintptr_t address,uint64_t size) 
     }
     read_unlock();
     return result;
+}
+/* Diagnostic-only bounded metadata read. Low native image/stack mappings are not
+ * pool VMAs. Use an OS-checked read there, never a raw-pointer fallback. */
+int runtime_memory_debug_read(uintptr_t address,void *data,uint64_t size) {
+    if(!data || !size || size>4096 || size>UINTPTR_MAX-address) return 0;
+    const int saved_errno=errno;
+    int ok=0;
+#ifdef _WIN32
+    const DWORD saved_error=GetLastError();
+#endif
+    if(address>=LOW_MIN && address<USER_MIN && size<=USER_MIN-address) {
+#ifdef _WIN32
+        uintptr_t at=address, end=address+size;
+        while(at<end) {
+            MEMORY_BASIC_INFORMATION m;
+            if(VirtualQuery((const void *)at,&m,sizeof m)!=sizeof m || m.State!=MEM_COMMIT ||
+               (m.Protect&(PAGE_GUARD|PAGE_NOACCESS)) ||
+               !(m.Protect&(PAGE_READONLY|PAGE_READWRITE|PAGE_WRITECOPY|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))) break;
+            const uintptr_t start=(uintptr_t)m.BaseAddress;
+            if(m.RegionSize>UINTPTR_MAX-start || start+m.RegionSize<=at) break;
+            at=start+m.RegionSize<end ? start+m.RegionSize:end;
+        }
+        SIZE_T got=0;
+        if(at==end) ok=ReadProcessMemory(GetCurrentProcess(),(const void *)address,data,(SIZE_T)size,&got) && got==size;
+#else
+        struct iovec local={data,(size_t)size}, remote={(void *)address,(size_t)size};
+        ok=process_vm_readv(getpid(),&local,1,&remote,1,0)==(ssize_t)size;
+#endif
+    } else if(address>=USER_MIN && address<USER_MAX && size<=USER_MAX-address) {
+        ok=backing_copy(address,data,size,0);
+    }
+#ifdef _WIN32
+    SetLastError(saved_error);
+#endif
+    errno=saved_errno;
+    return ok;
 }
 /* Writes through the backing view; 0 when part of the range has no backing. */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) { return backing_copy(address,(void *)data,size,1); }

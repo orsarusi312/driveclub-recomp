@@ -207,7 +207,9 @@ static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
 #if BB_DIAGNOSTICS
     RpkCopyTicket trace; int prior_errno=errno;
-    runtime_rpk_copy_begin((uintptr_t)src,(uintptr_t)dst,size,&trace); errno=prior_errno;
+    runtime_rpk_copy_begin((uintptr_t)src,(uintptr_t)dst,size,&trace);
+    if(trace.valid) trace.caller=guest_cpu_return_address((uintptr_t)__builtin_return_address(0));
+    errno=prior_errno;
 #endif
     void *result=dst;
     if (size >= MEMOPS_MIN &&
@@ -223,7 +225,9 @@ static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
 #if BB_DIAGNOSTICS
     RpkCopyTicket trace; int prior_errno=errno;
-    runtime_rpk_copy_begin((uintptr_t)src,(uintptr_t)dst,size,&trace); errno=prior_errno;
+    runtime_rpk_copy_begin((uintptr_t)src,(uintptr_t)dst,size,&trace);
+    if(trace.valid) trace.caller=guest_cpu_return_address((uintptr_t)__builtin_return_address(0));
+    errno=prior_errno;
 #endif
     void *result=dst;
     /* Overlapping moves keep the CRT (a forward chunked copy could read bytes it already overwrote). */

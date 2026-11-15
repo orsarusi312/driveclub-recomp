@@ -83,6 +83,7 @@ static unsigned rpk_trace_logs;
 extern int runtime_memory_read_backing(uintptr_t,void*,uint64_t);
 #include "runtime_rpk_copy_impl.h"
 #include "runtime_rpk_clear_impl.h"
+#include "runtime_rpk_read_watch.h"
 static void rpk_trace_init(void) {
     const char *path=BB_DIAGNOSTIC_ENV("BB_RPK_TRACE_FILE");
     if (!path || !*path) return;
@@ -94,10 +95,15 @@ static void rpk_trace_init(void) {
     }
     rpk_debug_init();
     rpk_clear_init();
+    rpk_read_watch_init();
     fprintf(stderr,"RpkTrace: enabled path=%s resources=%u limit=64; file reads only, not native selection\n",
             rpk_trace_config.path,rpk_trace_config.count);
     const char *copy=BB_DIAGNOSTIC_ENV("BB_RPK_COPY_TRACE");
     rpk_copy_enabled=copy && !strcmp(copy,"1") && rpk_trace_config.prefix.id;
+    const char *copy_read=BB_DIAGNOSTIC_ENV("BB_RPK_COPY_READ");
+    rpk_copy_read_target=rpk_debug_target(copy_read);
+    if(copy_read && !rpk_copy_read_target) { rpk_copy_enabled=0; fputs("RpkCopy: invalid read selection; disabled (use 1 or 2)\n",stderr); }
+    if(rpk_copy_enabled && rpk_copy_read_target) fprintf(stderr,"RpkCopy: initial seed restricted to verified read %u\n",rpk_copy_read_target);
     if(rpk_copy_enabled) fputs("RpkCopy: enabled; waits for verified read prefix; 16 addresses, 262144 HLE calls, 64 candidate copies\n",stderr);
 }
 static int rpk_trace_watches(const char *path) {
@@ -136,12 +142,13 @@ static void rpk_trace_note(const char *path,int64_t offset,uintptr_t buffer,int6
         }
         uintptr_t prefix_address=0;
         const char *prefix=rpk_trace_check_prefix(&rpk_trace_config.prefix,s.id,at,length,address,&prefix_address);
-        if(!strcmp(prefix,"verified") && (!strcmp(header,"verified") || !strcmp(header,"partial"))) rpk_copy_seed(prefix_address);
+        rpk_copy_read_seed(prefix_address,header,prefix);
         fprintf(stderr,"RpkTrace: id=%016llx file-offset=%llu resource-offset=%llu bytes=%llu guest=0x%llx header=%s method=%s position-prefix=%s prefix-guest=0x%llx; read destination only, lifetime/copies unknown\n",
             (unsigned long long)s.id,(unsigned long long)((uint64_t)offset+address-buffer),
             (unsigned long long)at,(unsigned long long)length,(unsigned long long)address,header,method,prefix,(unsigned long long)prefix_address);
         const RpkTracePrefix *q=&rpk_trace_config.prefix;
         const RpkDebugRead debug_read={s.id,(uint64_t)offset,(uint64_t)bytes,buffer,prefix_address,q->stride,q->width,q->samples};
+        rpk_read_watch_seed(&debug_read,header,prefix);
         rpk_clear_seed(&debug_read,header,prefix);
         rpk_debug_read_note(&debug_read,header,prefix); // Last prefix observation before returning to the read caller.
     }

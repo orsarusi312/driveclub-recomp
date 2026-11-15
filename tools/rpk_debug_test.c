@@ -58,3 +58,5 @@ int main(void) {
     }
     puts("RPK debug boundary: strict selection, verified-only, no debugger, one-shot, concurrency, unchanged input and OFF/default gates passed");
 }
+
+int runtime_memory_debug_read(uintptr_t address,void *out,uint64_t bytes) { return runtime_memory_read_backing(address,out,bytes); }

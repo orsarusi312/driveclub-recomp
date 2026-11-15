@@ -103,3 +103,5 @@ int main(void) {
     observe(base,256); assert(pauses==1 && reads==17);
     puts("RPK clear: verified-only selection, no reseed, overlap/padding/overflow, fresh/stale/unreadable, debugger gate, budgets, concurrency, peer entry, errors and unchanged bytes passed");
 }
+
+int runtime_memory_debug_read(uintptr_t address,void *out,uint64_t bytes) { return runtime_memory_read_backing(address,out,bytes); }

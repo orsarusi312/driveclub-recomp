@@ -64,3 +64,5 @@ int main(void) {
     assert(calls==(BB_DIAGNOSTICS ? 4u:0u) && bytes_read==(BB_DIAGNOSTICS ? 264u:0u));
     puts("RPK reader: bounded metadata, malformed layouts, pointers, overflow, table failures, unchanged bytes, selected-read coupling and OFF/default gates passed");
 }
+
+int runtime_memory_debug_read(uintptr_t address,void *out,uint64_t bytes) { return runtime_memory_read_backing(address,out,bytes); }

@@ -73,3 +73,5 @@ int main(void) {
     strcpy(malformed,v2); malformed[strlen(malformed)-2]='z'; assert(!parse(malformed,&c2));
     remove(path); puts("RPK trace: parse, overlap, overflow, split reads, build gate and log/read cap passed");
 }
+
+int runtime_memory_debug_read(uintptr_t address,void *out,uint64_t bytes) { return runtime_memory_read_backing(address,out,bytes); }

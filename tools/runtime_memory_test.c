@@ -41,6 +41,37 @@ int main(void) {
     assert(!runtime_memory_debug_backing_address(boundary,1));
     assert(!runtime_memory_debug_backing_address(UINTPTR_MAX,8));
     assert(!runtime_memory_debug_backing_address(boundary,0));
+    unsigned char *low=runtime_low_map(PAGE,3); assert(low);
+    memcpy(low,"native-vtable",14);
+    char metadata[32]={0}; errno=EDOM;
+    int low_read_supported=1;
+#ifndef _WIN32
+    struct iovec local_probe={metadata,14}, remote_probe={low,14};
+    if(process_vm_readv(getpid(),&local_probe,1,&remote_probe,1,0)<0 && (errno==ENOSYS || errno==EPERM)) {
+        low_read_supported=0;
+        puts("SKIP: native-low successful read (self process_vm_readv unavailable in this environment)");
+    }
+#endif
+    errno=EDOM;
+    if(low_read_supported) assert(runtime_memory_debug_read((uintptr_t)low,metadata,14) && !strcmp(metadata,"native-vtable") && errno==EDOM);
+    else assert(!runtime_memory_debug_read((uintptr_t)low,metadata,14) && errno==EDOM);
+    assert(!runtime_memory_read_backing((uintptr_t)low,metadata,14)); // separate mapping domain
+    assert(!runtime_memory_debug_read((uintptr_t)low,NULL,8));
+    assert(!runtime_memory_debug_read((uintptr_t)low,metadata,4097));
+    assert(!runtime_memory_debug_read(UINTPTR_MAX-1,metadata,8));
+#ifdef _WIN32
+    DWORD old;
+    assert(VirtualProtect(low,PAGE,PAGE_NOACCESS,&old));
+    SetLastError(ERROR_INVALID_HANDLE);
+    assert(!runtime_memory_debug_read((uintptr_t)low,metadata,8) && GetLastError()==ERROR_INVALID_HANDLE);
+    assert(VirtualProtect(low,PAGE,old,&old));
+    assert(VirtualFree(low,0,MEM_RELEASE));
+#else
+    assert(!mprotect(low,PAGE,PROT_NONE));
+    assert(!runtime_memory_debug_read((uintptr_t)low,metadata,8));
+    assert(!munmap(low,PAGE));
+#endif
+    assert(!runtime_memory_debug_read((uintptr_t)low,metadata,8));
     uintptr_t base=boundary-2*PAGE;
     void *reserved=(void *)base;
 #ifdef _WIN32
@@ -67,6 +98,7 @@ int main(void) {
     *left=0x1234; *right=0x5678;
     uint64_t copy=0;
     assert(runtime_memory_read_backing(boundary,&copy,8) && copy==*right);
+    assert(runtime_memory_debug_read(boundary,&copy,8) && copy==*right);
     uintptr_t alias=runtime_memory_debug_backing_address(boundary,8);
     assert(alias && *(const uint64_t*)alias==copy && *right==0x5678);
     assert(!runtime_memory_debug_backing_address(base,4*PAGE+1));

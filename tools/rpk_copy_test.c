@@ -35,7 +35,10 @@ int main(void) {
     assert(rpk_copy_partial==1 && !rpk_copy_logs);
     assert(!runtime_rpk_copy_begin(0x1020,0x1020,44,&ticket) && reads==before && !rpk_copy_logs);
     unsigned char unchanged[2048]; memcpy(unchanged,memory,sizeof memory);
-    assert(runtime_rpk_copy_begin(0x1000,0x1100,128,&ticket));
+    errno=EDOM;
+    assert(runtime_rpk_copy_begin(0x1000,0x1100,128,&ticket) && errno==EDOM);
+    assert(ticket.source_base==0x1000 && ticket.destination_base==0x1100 && ticket.bytes==128 && !ticket.caller);
+    ticket.caller=0x800591f1e;
     assert(!memcmp(unchanged,memory,sizeof memory)); // tracer never performs the copy
     memcpy(memory+256,memory,128); // the game operation between begin/end
     runtime_rpk_copy_end(&ticket); assert(rpk_copy_count==2);
@@ -78,5 +81,13 @@ int main(void) {
     // Verification budget independent from cheap range checks.
     rpk_copy_calls=0; rpk_copy_logs=64; rpk_copy_active=1;
     assert(!runtime_rpk_copy_begin(0x1120,0x1600,44,&ticket) && reads==before && !rpk_copy_active);
+    rpk_copy_calls=rpk_copy_logs=rpk_copy_count=rpk_copy_active=rpk_copy_read_seen=0;
+    rpk_copy_read_target=2;
+    rpk_copy_read_seed(0x1000,"partial","verified"); assert(!rpk_copy_read_seen);
+    rpk_copy_read_seed(0x1000,"verified","verified"); assert(!rpk_copy_count);
+    rpk_copy_read_seed(0x1100,"verified","verified"); assert(rpk_copy_count==1 && rpk_copy_seeds[0].address==0x1100);
+    rpk_copy_read_seed(0x1200,"verified","verified"); assert(rpk_copy_count==1);
     puts("RPK copy: exact source/destination, chaining, overlap, stale bytes, failed copy, range and budgets passed");
 }
+
+int runtime_memory_debug_read(uintptr_t address,void *out,uint64_t bytes) { return runtime_memory_read_backing(address,out,bytes); }
