@@ -14,6 +14,9 @@ import struct
 import sys
 
 BASE = 0x800000000
+# Target runtime: Windows x64 GetSystemInfo().dwPageSize, not PS4's 16 KiB page
+# or Windows' 64 KiB allocation granularity. Used only for patch-range admission.
+PATCH_PAGE_SIZE = 4096
 RETURNS = (0x800591F1E, 0x80058BDF3, 0x8007AAFA2)
 GUARDS = {0x800591E60: bytes.fromhex('554889e5'),
           0x800591F19: bytes.fromhex('e892c4ca00'),
@@ -70,7 +73,8 @@ class Image:
         self.segments = []
         for _ in range(ns):
             at, size, flags = (r.u64() for _ in range(3))
-            need(at <= self.size and size <= self.size-at and flags <= 7, 'invalid segment')
+            need(at <= self.size and size <= self.size-at and flags <= 7 and
+                 at % PATCH_PAGE_SIZE == 0, 'invalid segment')
             self.segments.append((at, size, flags))
         r.skip(ni*128)
         self.relocations = []
@@ -87,6 +91,14 @@ class Image:
         return at >= 0 and size > 0 and sum(
             a <= at and size <= n-(at-a) and (not executable or flags & 1)
             for a, n, flags in self.segments) == 1
+
+    def patchable(self, at, size):
+        # src/probe.c patchable(): any single segment may contain the entire
+        # patch, including its final page padding. Do not union adjacent ranges.
+        # This does NOT make padding readable code or a valid relocation target.
+        return at >= 0 and size > 0 and any(
+            a <= at and size <= ((n+PATCH_PAGE_SIZE-1) & ~(PATCH_PAGE_SIZE-1))-(at-a)
+            for a, n, _ in self.segments)
 
     def read(self, address, size, executable=False):
         at = address-BASE
@@ -112,9 +124,12 @@ class Image:
         r.u64()  # patch pointer base; no patch bytes are applied by this tool
         count = r.u64()
         need(count <= 100000, 'patch count exceeds inspection limit')
-        for _ in range(count):
+        for index in range(count):
             at, size = r.u64(), r.u64()
-            need(0 < size <= 4096 and self.mapped(at, size), 'invalid patch range')
+            need(0 < size <= 4096 and self.patchable(at, size),
+                 f'invalid patch range: patch[{index}] offset={at:#x} '
+                 f'guest-address={BASE+at:#x} size={size} ({size:#x}) '
+                 f'page-size={PATCH_PAGE_SIZE}')
             self.patches.append((at, size))
             r.skip(size)
         need(stream.tell() == r.size, 'trailing patch bytes')
@@ -198,6 +213,7 @@ def inspect(image_path, patch_path):
         decoder = disassembler()
         report = {'schema': 'dc-native-caller-static-v1', 'image_sha256': before[0],
                   'patch_sha256': before[1], 'image_format': 'BBPROBE6', 'guest_base': hex(BASE),
+                  'patch_page_size': PATCH_PAGE_SIZE,
                   'image_data_file_offset': image.data_offset,
                   'limits': 'three return windows, 512 bytes each; at most four 128-byte direct targets per site',
                   'caveat': 'linked bytes before runtime fixups; supplied patch/relocation overlaps blocked; guards do not prove whole-image runtime equivalence',

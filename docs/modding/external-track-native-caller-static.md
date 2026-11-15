@@ -1,5 +1,86 @@
 # Road742: inspect the request caller offline
 
+## Follow-up: Windows patch-padding rejection
+
+The three returned location reports establish that file offset 113877454 starts
+vertex-buffer payload **0003d12ccbd11945**, size **1132**, with a valid magic and
+payload ID matching the TOC. The Road742 position payload remains
+**0003a8908986f62b** at 113879809; its first sampled position is at payload offset
+23324. Thus the verified eight-byte transfer read the opening magic of another
+vertex-buffer payload. This still does not identify that resource's owner or the
+native function at the recorded parent return.
+
+The Python inspector incorrectly used the strict unrounded `mapped()` predicate
+to admit BBPATCH2 entries. `src/probe.c:patchable()` explicitly also permits a
+whole patch inside the page-rounded extent of any one segment. The Windows x64
+runtime obtains a **4096-byte page size** from GetSystemInfo; 64 KiB allocation
+granularity and PS4 page size are not used for this check. The prepared image
+stores unrounded segment sizes, so these predicates can differ on valid inputs.
+
+The mismatch is confirmed and reproduced synthetically. The supplied generic
+error does not identify the actual failing entry, and the user's binary patch
+file is not present here; the retry is needed to confirm that this was the only
+reason their file failed. Input hashes were reported unchanged.
+
+The fix adds a separate `patchable()` predicate for patch admission only. Code
+reads and relocation validation still require unrounded, unambiguous mappings;
+all code-window patch/relocation overlap refusals remain. Patches may cross from
+segment bytes into its last-page padding, but cannot span the rounded boundary
+into another segment. No patch is applied. Invalid entries now identify zero-based
+`patch[index]`, image offset, computed guest address, size and page size.
+
+The screenshot also shows Windows PowerShell treating unittest's ordinary stderr
+progress as `NativeCommandError`. That line ending in `ok` is not evidence of a
+failed assertion. Use Start-Process's OS-level redirection below and check the
+process ExitCode; do not infer success or failure from stderr being nonempty.
+
+Minimal retry, **same PowerShell session**, keeping `$Py`, `$Image`, `$Patches`
+from the prior run (no new venv, RPK scan, build, game launch or save access):
+
+```powershell
+$ErrorActionPreference='Stop'
+$Repo='H:\DC-Track-Test'
+git -C $Repo switch feat/external-track-foundation
+if($LASTEXITCODE -ne 0) { throw 'Branch switch failed; stop' }
+git -C $Repo pull --ff-only https://github.com/orsarusi312/driveclub-recomp.git feat/external-track-foundation
+if($LASTEXITCODE -ne 0) { throw 'Update failed; stop' }
+foreach($File in @($Py,$Image,$Patches)) {
+  if(-not $File -or -not (Test-Path -LiteralPath $File -PathType Leaf)) { throw 'Restore the existing Python/image/patch paths' }
+}
+$Retry="$Repo\work\road742-static-retry-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory $Retry | Out-Null
+git -C $Repo rev-parse HEAD | Set-Content "$Retry\commit.txt"
+$Before=@(Get-FileHash -LiteralPath $Image,$Patches)
+$TestArgs=@('-m','unittest','discover','-s',"`"$Repo\tools\track_import\tests`"",'-p','test_native_caller.py','-v')
+$Test=Start-Process -FilePath $Py -ArgumentList $TestArgs -Wait -PassThru `
+  -RedirectStandardOutput "$Retry\tests-stdout.log" -RedirectStandardError "$Retry\tests-stderr.log"
+if($Test.ExitCode -ne 0) { throw "Offline tests failed: $($Test.ExitCode); inspect retry logs" }
+$InspectArgs=@("`"$Repo\tools\track_import\inspect_native_caller.py`"",'--image',"`"$Image`"",'--patches',"`"$Patches`"",'--output',"`"$Retry\native-caller.json`"")
+$Inspect=Start-Process -FilePath $Py -ArgumentList $InspectArgs -Wait -PassThru `
+  -RedirectStandardOutput "$Retry\inspect-stdout.log" -RedirectStandardError "$Retry\inspect-stderr.log"
+if($Inspect.ExitCode -ne 0) { throw "Inspection failed: $($Inspect.ExitCode); return the detailed retry error" }
+$After=@(Get-FileHash -LiteralPath $Image,$Patches)
+if(Compare-Object $Before $After -Property Path,Hash) { throw 'Input hash changed; stop' }
+$After | Select-Object Path,Hash | Export-Csv "$Retry\input-hashes.csv" -NoTypeInformation
+Write-Host "Return native-caller.json, commit.txt, hash CSV and the four logs from $Retry"
+```
+
+If reopening PowerShell, restore the existing paths first:
+
+```powershell
+$Previous=Read-Host 'Full existing road742-static-caller directory containing the venv'
+$Py=Join-Path $Previous 'venv\Scripts\python.exe'
+$Image='H:\DRIVECLUB TO PC\Launcher\driveclub-recomp-0.4.0-win64\data\prep\boot-linked.bin'
+$Patches='H:\DRIVECLUB TO PC\Launcher\driveclub-recomp-0.4.0-win64\data\prep\patches.bin'
+```
+
+Validation of this fix: all ten offline inspector tests passed with Capstone,
+including valid final-page padding (also beyond the on-disk image end), exact end
+boundaries, cross-segment refusal, out-of-range/oversized/overflowing patches,
+entry-specific errors and continued strict code/relocation rejection. Existing
+guard and input-integrity tests passed. Windows retry remains pending; no runtime
+or asset files changed.
+
 ## Recovered state and Windows evidence
 
 Continued the clean branch at `31bd5480489fc2acd9c41aed72b9dd8d2d8da8ca`, matching
@@ -204,13 +285,14 @@ if($LASTEXITCODE -ne 0) { throw 'venv creation failed' }
 $Py="$Run\venv\Scripts\python.exe"
 & $Py -m pip install 'capstone==5.0.6'
 if($LASTEXITCODE -ne 0) { throw 'Capstone install failed' }
-& $Py -m unittest discover -s "$Repo\tools\track_import\tests" -p test_native_caller.py -v `
-  1> "$Run\tests-stdout.log" 2> "$Run\tests-stderr.log"
-if($LASTEXITCODE -ne 0) { throw 'Offline decoder tests failed' }
-& $Py "$Repo\tools\track_import\inspect_native_caller.py" `
-  --image $Image --patches $Patches --output "$Run\native-caller.json" `
-  1> "$Run\inspect-stdout.log" 2> "$Run\inspect-stderr.log"
-if($LASTEXITCODE -ne 0) { throw 'Inspection refused the inputs; return the error logs without launching the game' }
+$TestArgs=@('-m','unittest','discover','-s',"`"$Repo\tools\track_import\tests`"",'-p','test_native_caller.py','-v')
+$Test=Start-Process -FilePath $Py -ArgumentList $TestArgs -Wait -PassThru `
+  -RedirectStandardOutput "$Run\tests-stdout.log" -RedirectStandardError "$Run\tests-stderr.log"
+if($Test.ExitCode -ne 0) { throw 'Offline decoder tests failed' }
+$InspectArgs=@("`"$Repo\tools\track_import\inspect_native_caller.py`"",'--image',"`"$Image`"",'--patches',"`"$Patches`"",'--output',"`"$Run\native-caller.json`"")
+$Inspect=Start-Process -FilePath $Py -ArgumentList $InspectArgs -Wait -PassThru `
+  -RedirectStandardOutput "$Run\inspect-stdout.log" -RedirectStandardError "$Run\inspect-stderr.log"
+if($Inspect.ExitCode -ne 0) { throw 'Inspection refused the inputs; return the error logs without launching the game' }
 $After=@(Get-FileHash -LiteralPath $Pack,$Image,$Patches -Algorithm SHA256)
 $After | Select-Object Path,Hash | Export-Csv "$Run\input-hashes-after.csv" -NoTypeInformation
 if(Compare-Object $Before $After -Property Path,Hash) { throw 'Input changed during inspection; retain evidence and stop' }

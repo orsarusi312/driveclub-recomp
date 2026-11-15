@@ -16,16 +16,17 @@ def u64(*values):
     return struct.pack('<'+'Q'*len(values), *values)
 
 
-def fixture(relocs=(), patches=()):
+def fixture(relocs=(), patches=(), segment_sizes=(0x1000,0x1000)):
     # Synthetic code and linked module, not extracted game data.
-    data = bytearray(b'\x90'*0x2000)
+    image_size=0x1000+segment_sizes[1]
+    data = bytearray(b'\x90'*image_size)
     data[0x3fb:0x400] = b'\xe8'+struct.pack('<i', 0x600-0x400)
     data[0x400:0x403] = b'\x84\xc0\xc3'
     data[0x3e0:0x3e4] = bytes.fromhex('554889e5')
     data[0x600:0x605] = bytes.fromhex('554889e5c3')
-    header = b'BBPROBE6'+u64(0x2000,0x300,2,len(relocs),0,1)+u64(0,0,0,0,0,1)
-    header += u64(0x1000,0x1000,0x1000,0,0,0,0,0)+b'fixture\0'.ljust(32,b'\0')
-    header += u64(0)+u64(0,0x1000,5)+u64(0x1000,0x1000,4)
+    header = b'BBPROBE6'+u64(image_size,0x300,2,len(relocs),0,1)+u64(0,0,0,0,0,1)
+    header += u64(0x1000,segment_sizes[1],0x1000,0,0,0,0,0)+b'fixture\0'.ljust(32,b'\0')
+    header += u64(0)+u64(0,segment_sizes[0],5)+u64(0x1000,segment_sizes[1],4)
     header += b''.join(u64(at,0,0,0) for at in relocs)
     patch = b'BBPATCH2'+u64(0x400000,len(patches))
     patch += b''.join(u64(at,len(value))+value for at,value in patches)
@@ -50,7 +51,7 @@ class ImageTests(unittest.TestCase):
         data,_ = fixture()
         for invalid in [b'',b'BBPROBE5'+data[8:],data[:-1],data+b'x',data[:40]]:
             with self.assertRaises(ValueError): native.Image(io.BytesIO(invalid))
-        for offset,value in [(8,2**63),(24,65),(32,1000001),(40,100001),(48,2),(96,33)]:
+        for offset,value in [(8,2**63),(24,65),(32,1000001),(40,100001),(48,2),(96,33),(208,1)]:
             broken=bytearray(data);struct.pack_into('<Q',broken,offset,value)
             with self.assertRaises(ValueError): native.Image(io.BytesIO(broken))
 
@@ -70,6 +71,38 @@ class ImageTests(unittest.TestCase):
             with self.assertRaises(ValueError): self.image().load_patches(io.BytesIO(value))
         for at,value in [(0x2000,b'x'),(0,b''),(0,b'x'*4097)]:
             with self.assertRaises(ValueError): self.image(patches=[(at,value)])
+
+    def test_final_page_patch_padding_only(self):
+        sizes=(0x681,0x123)
+        for at,value in [(0x680,b'xx'),(0x681,b'x'),(0xfff,b'x'),
+                         (0x1123,b'x'),(0x1fff,b'x')]:
+            with self.subTest(at=at):
+                image=self.image(segment_sizes=sizes,patches=[(at,value)])
+                self.assertIn((at,len(value)),image.patches)
+                self.assertTrue(image.patchable(at,len(value)))
+                self.assertFalse(image.mapped(at,len(value)))
+                with self.assertRaises(ValueError): image.read(native.BASE+at,len(value))
+                with self.assertRaises(ValueError): image.code(native.BASE+at,len(value))
+        # Padding is not made available to code or relocations without a patch either.
+        image=self.image(segment_sizes=sizes)
+        with self.assertRaises(ValueError): image.code(native.BASE+0x681,1)
+        with self.assertRaises(ValueError): self.image(segment_sizes=sizes,relocs=[0x681])
+
+    def test_padding_boundaries_and_patch_error_context(self):
+        for at,value in [(0xfff,b'xx'),(0x2000,b'x'),(0x1fff,b'xx'),
+                         (2**64-1,b'xx'),(0,b''),(0,b'x'*4097)]:
+            with self.subTest(at=at,size=len(value)), self.assertRaisesRegex(
+                    ValueError, r'invalid patch range: patch\[1\].*offset=.*guest-address=.*size='):
+                self.image(segment_sizes=(0x681,0x123),patches=[(0,b'x'),(at,value)])
+        image=self.image(segment_sizes=(0x681,0x123))
+        self.assertFalse(image.patchable(-1,1))
+        self.assertFalse(image.patchable(0,0))
+        image.segments=[(0x1000,0x123,4)]
+        self.assertFalse(image.patchable(0xfff,1)) # before this segment, not leading padding
+        # Raw-code overlap protection still blocks valid patches within the code window.
+        image=self.image(segment_sizes=(0x681,0x123),patches=[(0x680,b'xx')])
+        with self.assertRaisesRegex(ValueError,'unapplied patches'):
+            image.code(native.BASE+0x680,1)
 
     @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
     def test_bounded_call_site_candidates(self):
