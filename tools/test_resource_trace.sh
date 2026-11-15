@@ -7,6 +7,14 @@ cxx=${CXX:-clang++}; command -v "$cxx" >/dev/null || cxx=g++
 flags=(-O1 -g -Wall -Wextra -Werror -UNDEBUG -pthread)
 if [[ ${SANITIZE:-0} == 1 ]]; then flags+=(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-pie -no-pie); fi
 for mode in 0 1; do
+    if [[ ${OS:-} != Windows_NT ]]; then
+        "$cc" -std=c11 -I. "${flags[@]}" -ffunction-sections -fdata-sections -Wl,--gc-sections -DBB_DIAGNOSTICS=$mode tools/runtime_memset_trace_test.c -o out/tests/runtime-memset-trace-$mode.exe
+        out/tests/runtime-memset-trace-$mode.exe
+    else
+        echo "Guest memset wrapper harness: skipped (requires ELF section garbage collection); observer tests still run"
+    fi
+    "$cc" -std=c11 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/rpk_clear_test.c tools/rpk_clear_test_peer.c -o out/tests/rpk-clear-$mode.exe
+    out/tests/rpk-clear-$mode.exe
     "$cc" -std=c11 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/rpk_debug_test.c -o out/tests/rpk-debug-$mode.exe
     out/tests/rpk-debug-$mode.exe
     "$cxx" -std=c++17 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/buffer_path_test.cpp tools/buffer_path_test_peer.cpp -o out/tests/buffer-path-$mode.exe

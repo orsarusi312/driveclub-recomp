@@ -82,6 +82,7 @@ static pthread_once_t rpk_trace_once=PTHREAD_ONCE_INIT;
 static unsigned rpk_trace_logs;
 extern int runtime_memory_read_backing(uintptr_t,void*,uint64_t);
 #include "runtime_rpk_copy_impl.h"
+#include "runtime_rpk_clear_impl.h"
 static void rpk_trace_init(void) {
     const char *path=BB_DIAGNOSTIC_ENV("BB_RPK_TRACE_FILE");
     if (!path || !*path) return;
@@ -92,6 +93,7 @@ static void rpk_trace_init(void) {
         fputs("RpkTrace: invalid/unreadable manifest; disabled\n",stderr); return;
     }
     rpk_debug_init();
+    rpk_clear_init();
     fprintf(stderr,"RpkTrace: enabled path=%s resources=%u limit=64; file reads only, not native selection\n",
             rpk_trace_config.path,rpk_trace_config.count);
     const char *copy=BB_DIAGNOSTIC_ENV("BB_RPK_COPY_TRACE");
@@ -140,6 +142,7 @@ static void rpk_trace_note(const char *path,int64_t offset,uintptr_t buffer,int6
             (unsigned long long)at,(unsigned long long)length,(unsigned long long)address,header,method,prefix,(unsigned long long)prefix_address);
         const RpkTracePrefix *q=&rpk_trace_config.prefix;
         const RpkDebugRead debug_read={s.id,(uint64_t)offset,(uint64_t)bytes,buffer,prefix_address,q->stride,q->width,q->samples};
+        rpk_clear_seed(&debug_read,header,prefix);
         rpk_debug_read_note(&debug_read,header,prefix); // Last prefix observation before returning to the read caller.
     }
 }

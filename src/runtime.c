@@ -12,6 +12,7 @@
 #include <errno.h>
 #include "../gpu/shim/bbport_diagnostics.h"
 #include "runtime_rpk_copy.h"
+#include "runtime_rpk_clear.h"
 
 typedef struct {
     union { GuestCallback plain; void (ABI *with_arg)(void *); } callback;
@@ -187,6 +188,10 @@ static void memops_copy(void *dst, const void *src, size_t size) {
 }
 static ABI void *guest_memset(void *dst, int value, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+#if BB_DIAGNOSTICS
+    runtime_rpk_clear_before((uintptr_t)dst,value,size,
+        guest_cpu_return_address((uintptr_t)__builtin_return_address(0)));
+#endif
     if (size >= MEMOPS_MIN && bbgpu_guest_gpu_pages((uintptr_t)dst, size)) {
         memset(memops_a, value, size < MEMOPS_CHUNK ? size : MEMOPS_CHUNK);
         for (size_t done = 0; done < size;) {

@@ -1,3 +1,5 @@
+> Latest experiment: [inspect the native caller before the verified read buffer is cleared](external-track-before-clear.md).
+
 # Road742: trace file reads and search actual vertex bindings
 
 Latest experiment: [verified read boundary and debugger watchpoints](external-track-read-boundary.md).
