@@ -170,6 +170,40 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(calls['scanned_bytes'],0x1000000)
 
     @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
+    def test_payload_profile_guard_and_overlap(self):
+        image=self.image(); decoder=native.disassembler()
+        calls=((native.BASE+0x300,native.BASE+0x600),)
+        image.stream.seek(image.data_offset+0x300)
+        image.stream.write(b'\xe8'+struct.pack('<i',0x600-0x305))
+        with mock.patch.object(native,'PAYLOAD_CALLS',calls):
+            result=native.payload_details(image,decoder)
+            self.assertEqual(result['helpers'][0]['instructions'][-1]['mnemonic'],'ret')
+            image.patches=[(0x600,1)]
+            self.assertIn('blocked',native.payload_details(image,decoder)['helpers'][0])
+            image.patches=[(0x300,1)]
+            with self.assertRaises(ValueError): native.payload_details(image,decoder)
+        with mock.patch.object(native,'PAYLOAD_CALLS',((native.BASE+0x300,native.BASE+0x700),)):
+            image.patches=[]
+            with self.assertRaisesRegex(ValueError,'call guard mismatch'):
+                native.payload_details(image,decoder)
+
+    @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
+    def test_payload_profile_does_not_repeat_prior_searches(self):
+        data,patch=fixture()
+        with tempfile.TemporaryDirectory() as temp:
+            image=Path(temp)/'boot.bin';patches=Path(temp)/'patches.bin'
+            image.write_bytes(data);patches.write_bytes(patch)
+            with mock.patch.object(native,'GUARDS',{}), mock.patch.object(native,'PAYLOAD_CALLS',()), \
+                 mock.patch.object(native,'site_report',side_effect=AssertionError('repeated site scan')), \
+                 mock.patch.object(native,'reader_details',side_effect=AssertionError('repeated reader scan')):
+                result=native.inspect(image,patches,include_payload_details=True)
+                self.assertEqual(result['sites'],[])
+                self.assertIn('payload_details',result)
+                self.assertEqual(image.read_bytes(),data)
+                self.assertEqual(patches.read_bytes(),patch)
+            with self.assertRaises(ValueError): native.inspect(image,patches,True,True)
+
+    @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
     def test_bounded_call_site_candidates(self):
         image=self.image(); decoder=native.disassembler()
         report=native.site_report(image,native.BASE+0x400,decoder)

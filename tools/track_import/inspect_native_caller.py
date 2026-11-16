@@ -26,6 +26,11 @@ READER_GUARDS = {
     0x8007aafa2: bytes.fromhex('817de442494720750b'),
     0x8007ab060: bytes.fromhex('4883c71889d2e9050ddeff'),
 }
+# Direct call encodings from the successful reader-details report. These anchor
+# only the requested follow-up, not the semantics or runtime execution of a helper.
+PAYLOAD_CALLS = ((0x80077c075, 0x8007ab640),
+                 (0x80077c084, 0x8007601d0),
+                 (0x80077c10c, 0x80077bec0))
 
 
 def need(ok, message):
@@ -294,6 +299,24 @@ def reader_details(image, decoder):
     return result
 
 
+def payload_details(image, decoder):
+    from native_control_flow import walk
+    result = {'schema': 'dc-payload-details-v1',
+              'scope': 'three exact helper targets; field meaning and target-resource consumption remain unproven',
+              'limits': '1024 code bytes, 256 instructions and 32 blocks per helper; no call following or image search',
+              'helpers': []}
+    for call, target in PAYLOAD_CALLS:
+        expected = b'\xe8'+struct.pack('<i', target-(call+5))
+        need(image.code(call, 5) == expected, 'payload-details call guard mismatch at '+hex(call))
+        row = {'call_evidence': hex(call), 'target': hex(target)}
+        try:
+            row.update(walk(image.code(target, 1024), target, decoder))
+        except ValueError as exc:
+            row['blocked'] = str(exc)
+        result['helpers'].append(row)
+    return result
+
+
 def digest(path):
     h = hashlib.sha256()
     with path.open('rb') as stream:
@@ -302,7 +325,8 @@ def digest(path):
     return h.hexdigest()
 
 
-def inspect(image_path, patch_path, include_reader_details=False):
+def inspect(image_path, patch_path, include_reader_details=False, include_payload_details=False):
+    need(not (include_reader_details and include_payload_details), 'select one follow-up profile')
     before = [digest(image_path), digest(patch_path)]
     with image_path.open('rb') as stream, patch_path.open('rb') as patches:
         image = Image(stream)
@@ -317,9 +341,12 @@ def inspect(image_path, patch_path, include_reader_details=False):
                   'image_data_file_offset': image.data_offset,
                   'limits': 'three return windows, 512 bytes each; at most four 128-byte direct targets per site',
                   'caveat': 'linked bytes before runtime fixups; supplied patch/relocation overlaps blocked; guards do not prove whole-image runtime equivalence',
-                  'sites': [site_report(image, address, decoder) for address in RETURNS]}
+                  'sites': [] if include_payload_details else [site_report(image, address, decoder) for address in RETURNS]}
         if include_reader_details:
             report['reader_details'] = reader_details(image, decoder)
+        if include_payload_details:
+            report['limits'] = 'three fixed helper windows only; prior return/vtable/caller search not repeated'
+            report['payload_details'] = payload_details(image, decoder)
     need(before == [digest(image_path), digest(patch_path)], 'input changed during inspection; discard report')
     return report
 
@@ -329,12 +356,15 @@ def main():
     parser.add_argument('--image', required=True, type=Path)
     parser.add_argument('--patches', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--reader-details', action='store_true',
+    profile = parser.add_mutually_exclusive_group()
+    profile.add_argument('--reader-details', action='store_true',
                         help='bounded static reader-vtable and initializer-caller follow-up')
+    profile.add_argument('--payload-details', action='store_true',
+                        help='inspect three known helper targets; do not repeat earlier searches')
     args = parser.parse_args()
     try:
         need(not args.output.exists(), 'output already exists; use a fresh report path')
-        report = inspect(args.image, args.patches, args.reader_details)
+        report = inspect(args.image, args.patches, args.reader_details, args.payload_details)
         with args.output.open('x', encoding='utf-8') as stream:
             json.dump(report, stream, indent=2)
             stream.write('\n')
