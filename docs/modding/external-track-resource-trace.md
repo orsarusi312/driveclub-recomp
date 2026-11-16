@@ -1,4 +1,6 @@
-> Latest experiment: [offline request-caller and resource-span inspection](external-track-native-caller-static.md).
+> Latest experiment: [static reader initialization, vtable and caller details](external-track-reader-initializer.md).
+
+> Previous experiment: [offline request-caller and resource-span inspection](external-track-native-caller-static.md).
 
 > Previous experiment: [identify the initial request caller](external-track-request-caller.md).
 

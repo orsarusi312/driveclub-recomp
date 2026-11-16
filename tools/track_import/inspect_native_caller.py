@@ -21,6 +21,11 @@ RETURNS = (0x800591F1E, 0x80058BDF3, 0x8007AAFA2)
 GUARDS = {0x800591E60: bytes.fromhex('554889e5'),
           0x800591F19: bytes.fromhex('e892c4ca00'),
           0x80058BDF0: bytes.fromhex('ff501884c0')}
+READER_GUARDS = {
+    0x8007aaf75: bytes.fromhex('488d05b48ce4004883c010488903'),
+    0x8007aafa2: bytes.fromhex('817de442494720750b'),
+    0x8007ab060: bytes.fromhex('4883c71889d2e9050ddeff'),
+}
 
 
 def need(ok, message):
@@ -78,10 +83,12 @@ class Image:
             self.segments.append((at, size, flags))
         r.skip(ni*128)
         self.relocations = []
+        self.relocation_records = []
         for _ in range(nr):
             at, kind, value, addend = (r.u64() for _ in range(4))
             need(self.mapped(at, 8) and kind <= 2 and (not kind or value < ni), 'invalid relocation')
             self.relocations.append(at)
+            self.relocation_records.append((at, kind, value, addend))
         self.data_offset = stream.tell()
         need(r.size-self.data_offset == self.size, 'incorrect image length or trailing bytes')
         self.stream = stream
@@ -133,6 +140,24 @@ class Image:
             self.patches.append((at, size))
             r.skip(size)
         need(stream.tell() == r.size, 'trailing patch bytes')
+
+    def relative_function(self, address):
+        """Interpret one kind-0 relocation as metadata, never patch the image.
+
+        src/probe.c uses image_base + value for kind 0. Import kinds need runtime
+        resolution and are deliberately unsupported here, as are patched slots.
+        """
+        raw = self.read(address, 8)
+        need(not self.overlaps(address, 8)['patches'], 'pointer slot overlaps a patch')
+        at = address-BASE
+        records = [r for r in self.relocation_records if r[0] < at+8 and at < r[0]+8]
+        need(len(records) == 1 and records[0][0] == at, 'missing/partial/ambiguous pointer relocation')
+        _, kind, value, addend = records[0]
+        need(kind == 0 and addend == 0, 'pointer needs unsupported import/addend resolution')
+        need(self.mapped(value, 1, True), 'relative pointer target is not unambiguous executable code')
+        return {'slot': hex(address), 'stored_bytes': raw.hex(), 'relocation_kind': kind,
+                'image_relative_value': hex(value), 'target': hex(BASE+value),
+                'scope': 'predicted from kind-0 relocation; not a live vtable observation'}
 
 
 def disassembler():
@@ -194,6 +219,81 @@ def site_report(image, address, decoder):
     return result
 
 
+def direct_call_candidates(image, target, decoder, byte_budget=32*1024*1024, limit=8):
+    """Bounded static E8 search. Pattern hits can be embedded data/other instructions.
+    Scan only declared executable segments, never heap/GPU memory or asset data.
+    """
+    need(0 < byte_budget <= 32*1024*1024 and 0 < limit <= 8, 'invalid call-search budget')
+    result = {'target': hex(target), 'scanned_bytes': 0, 'complete': False, 'candidates': [],
+              'scope': 'E8 byte-pattern candidates, not verified instruction boundaries or executed calls'}
+    for start, size, flags in sorted(image.segments):
+        if not flags & 1:
+            continue
+        done, tail = 0, b''
+        while done < size:
+            left = byte_budget-result['scanned_bytes']
+            if not left:
+                result['stop'] = 'byte-budget'; return result
+            n = min(1024, size-done, left)
+            block = image.read(BASE+start+done, n, True)
+            data, address = tail+block, BASE+start+done-len(tail)
+            result['scanned_bytes'] += n
+            pos = 0
+            while True:
+                pos = data.find(b'\xe8', pos)
+                if pos < 0 or pos+5 > len(data):
+                    break
+                call = address+pos
+                displacement = struct.unpack_from('<i', data, pos+1)[0]
+                pos += 1
+                if call+5+displacement != target:
+                    continue
+                row = {'call_candidate': hex(call), 'return_candidate': hex(call+5)}
+                try:
+                    # Strict code() still refuses patches/relocations. No inferred
+                    # function entry or recursive call graph is constructed.
+                    row['call'] = instructions(decoder, image.code(call, 5), call)
+                    row['forward_from_return'] = instructions(decoder, image.code(call+5, 192), call+5)
+                except ValueError as exc:
+                    row['blocked'] = str(exc)
+                result['candidates'].append(row)
+                if len(result['candidates']) >= limit:
+                    result['stop'] = 'candidate-budget'; return result
+            tail = data[-4:]
+            done += n
+    result['complete'] = True
+    result['stop'] = 'declared-executable-segments-exhausted'
+    return result
+
+
+def reader_details(image, decoder):
+    # Evidence: uploaded report's RIP-relative LEA at 0x7aaf75, then add 0x10.
+    # Only the observed object's first four slots are inspected; no table size claim.
+    for address, expected in READER_GUARDS.items():
+        need(image.code(address, len(expected)) == expected,
+             'reader-details guard mismatch at '+hex(address))
+    vtable = 0x8007aaf75+7+0xe48cb4+0x10
+    result = {'schema': 'dc-reader-details-v1', 'vtable_address_point': hex(vtable),
+              'scope': 'static initializer, reader helpers and callers; flag meanings and resource selection not inferred',
+              'limits': 'three fixed code windows; four slots/256-byte previews; at most 32 MiB executable bytes and eight E8 candidates/192-byte continuations; no recursion',
+              'windows': [], 'slots': []}
+    for address, size in [(0x8007aaf40, 0x8d), (0x80058bc90, 0xe0), (0x8007ab060, 0xb)]:
+        result['windows'].append({'address': hex(address),
+                                  'instructions': instructions(decoder, image.code(address, size), address)})
+    for offset in (0, 8, 0x10, 0x18):
+        row = {'slot_offset': hex(offset)}
+        try:
+            pointer = image.relative_function(vtable+offset)
+            row.update(pointer)
+            target = int(pointer['target'], 16)
+            row['instructions'] = instructions(decoder, image.code(target, 256), target)
+        except ValueError as exc:
+            row['blocked'] = str(exc)
+        result['slots'].append(row)
+    result['initializer_call_candidates'] = direct_call_candidates(image, 0x8007aaf40, decoder)
+    return result
+
+
 def digest(path):
     h = hashlib.sha256()
     with path.open('rb') as stream:
@@ -202,7 +302,7 @@ def digest(path):
     return h.hexdigest()
 
 
-def inspect(image_path, patch_path):
+def inspect(image_path, patch_path, include_reader_details=False):
     before = [digest(image_path), digest(patch_path)]
     with image_path.open('rb') as stream, patch_path.open('rb') as patches:
         image = Image(stream)
@@ -218,6 +318,8 @@ def inspect(image_path, patch_path):
                   'limits': 'three return windows, 512 bytes each; at most four 128-byte direct targets per site',
                   'caveat': 'linked bytes before runtime fixups; supplied patch/relocation overlaps blocked; guards do not prove whole-image runtime equivalence',
                   'sites': [site_report(image, address, decoder) for address in RETURNS]}
+        if include_reader_details:
+            report['reader_details'] = reader_details(image, decoder)
     need(before == [digest(image_path), digest(patch_path)], 'input changed during inspection; discard report')
     return report
 
@@ -227,10 +329,12 @@ def main():
     parser.add_argument('--image', required=True, type=Path)
     parser.add_argument('--patches', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--reader-details', action='store_true',
+                        help='bounded static reader-vtable and initializer-caller follow-up')
     args = parser.parse_args()
     try:
         need(not args.output.exists(), 'output already exists; use a fresh report path')
-        report = inspect(args.image, args.patches)
+        report = inspect(args.image, args.patches, args.reader_details)
         with args.output.open('x', encoding='utf-8') as stream:
             json.dump(report, stream, indent=2)
             stream.write('\n')

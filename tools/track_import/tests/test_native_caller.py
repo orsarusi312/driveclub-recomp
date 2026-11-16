@@ -27,7 +27,7 @@ def fixture(relocs=(), patches=(), segment_sizes=(0x1000,0x1000)):
     header = b'BBPROBE6'+u64(image_size,0x300,2,len(relocs),0,1)+u64(0,0,0,0,0,1)
     header += u64(0x1000,segment_sizes[1],0x1000,0,0,0,0,0)+b'fixture\0'.ljust(32,b'\0')
     header += u64(0)+u64(0,segment_sizes[0],5)+u64(0x1000,segment_sizes[1],4)
-    header += b''.join(u64(at,0,0,0) for at in relocs)
+    header += b''.join(u64(*(at if isinstance(at,tuple) else (at,0,0,0))) for at in relocs)
     patch = b'BBPATCH2'+u64(0x400000,len(patches))
     patch += b''.join(u64(at,len(value))+value for at,value in patches)
     return header+data,patch
@@ -104,6 +104,71 @@ class ImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'unapplied patches'):
             image.code(native.BASE+0x680,1)
 
+    def test_relative_vtable_metadata_only(self):
+        image=self.image(relocs=[(0x1800,0,0x600,0)])
+        before=image.read(native.BASE+0x1800,8)
+        row=image.relative_function(native.BASE+0x1800)
+        self.assertEqual(row['target'],hex(native.BASE+0x600))
+        self.assertEqual(image.read(native.BASE+0x1800,8),before)
+        with self.assertRaises(ValueError): image.code(native.BASE+0x1800,8)
+        for records in [[],[(0x17ff,0,0x600,0)],[(0x1800,1,0,0)],
+                        [(0x1800,0,0x600,1)],[(0x1800,0,0x1800,0)],
+                        [(0x1800,0,0x600,0)]*2]:
+            image.relocation_records=records
+            with self.assertRaises(ValueError): image.relative_function(native.BASE+0x1800)
+        image.relocation_records=[(0x1800,0,0x600,0)]
+        image.patches=[(0x1807,1)]
+        with self.assertRaises(ValueError): image.relative_function(native.BASE+0x1800)
+
+    @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
+    def test_call_search_boundaries_budgets_and_refusals(self):
+        data,patch=fixture()
+        image=native.Image(io.BytesIO(data)); image.load_patches(io.BytesIO(patch))
+        stream=image.stream
+        # Call crosses the 1024-byte chunk boundary and must appear exactly once.
+        stream.seek(image.data_offset+0x3fb);stream.write(b'\x90'*5)
+        stream.seek(image.data_offset+0x3fe);stream.write(b'\xe8'+struct.pack('<i',0x600-0x403))
+        decoder=native.disassembler()
+        report=native.direct_call_candidates(image,native.BASE+0x600,decoder)
+        self.assertTrue(report['complete'])
+        self.assertEqual(report['scanned_bytes'],0x1000) # no data-segment scan
+        self.assertEqual([r['call_candidate'] for r in report['candidates']],[hex(native.BASE+0x3fe)])
+        limited=native.direct_call_candidates(image,native.BASE+0x600,decoder,byte_budget=1024)
+        self.assertFalse(limited['complete']);self.assertEqual(limited['candidates'],[])
+        limited=native.direct_call_candidates(image,native.BASE+0x600,decoder,limit=1)
+        self.assertEqual(limited['stop'],'candidate-budget')
+        image.patches=[(0x400,1)]
+        report=native.direct_call_candidates(image,native.BASE+0x600,decoder)
+        self.assertIn('blocked',report['candidates'][0])
+        with self.assertRaises(ValueError): native.direct_call_candidates(image,0,decoder,limit=9)
+
+    @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
+    def test_reader_profile_fails_closed_on_wrong_image(self):
+        with self.assertRaises(ValueError): native.reader_details(self.image(),native.disassembler())
+
+    @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
+    def test_reader_profile_synthetic_linked_image(self):
+        # Synthetic zero-filled image, only diagnostic guard bytes and a made-up
+        # call/RET. No original executable, vtable or resource data is embedded.
+        size=0x1600000; payload=bytearray(size)
+        for address,code in native.READER_GUARDS.items():
+            at=address-native.BASE;payload[at:at+len(code)]=code
+        payload[0x600]=0xc3
+        payload[0x800:0x805]=b'\xe8'+struct.pack('<i',0x7aaf40-0x805)
+        header=b'BBPROBE6'+u64(size,0x300,2,4,0,1)+u64(0,0,0,0,0,1)
+        header+=u64(0x1000000,0x600000,0x1000000,0,0,0,0,0)+b'fixture\0'.ljust(32,b'\0')
+        header+=u64(0)+u64(0,0x1000000,5)+u64(0x1000000,0x600000,4)
+        header+=b''.join(u64(0x15f3c40+i,0,0x600,0) for i in (0,8,16,24))
+        image=native.Image(io.BytesIO(header+payload))
+        report=native.reader_details(image,native.disassembler())
+        self.assertEqual(report['vtable_address_point'],'0x8015f3c40')
+        self.assertEqual(len(report['slots']),4)
+        self.assertTrue(all(row['target']==hex(native.BASE+0x600) for row in report['slots']))
+        calls=report['initializer_call_candidates']
+        self.assertTrue(calls['complete'])
+        self.assertEqual([r['call_candidate'] for r in calls['candidates']],[hex(native.BASE+0x800)])
+        self.assertEqual(calls['scanned_bytes'],0x1000000)
+
     @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
     def test_bounded_call_site_candidates(self):
         image=self.image(); decoder=native.disassembler()
@@ -137,6 +202,7 @@ class ImageTests(unittest.TestCase):
                     native,'GUARDS',{native.BASE+0x400:b'\x84\xc0'}):
                 report=native.inspect(image,patches)
                 self.assertEqual(report['sites'][0]['status'],'decoded')
+                self.assertNotIn('reader_details',report)
                 self.assertEqual(report['image_sha256'],native.digest(image))
                 self.assertEqual(image.read_bytes(),data)
                 self.assertEqual(patches.read_bytes(),patch)
