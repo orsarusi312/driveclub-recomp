@@ -1,5 +1,10 @@
 # Road742: separate scalar parsing from dynamic stream selection
 
+> Completed: the Windows run identified 0x80077bd96 as the actual caller. Continue
+> with [its selected dispatch](external-track-confirmed-dispatch.md), not the old
+> +0x30 hypothesis or another initializer-caller experiment. The reusable
+> PowerShell launch section below remains applicable.
+
 Recovered a clean local and remote branch at
 `264823d52eee47ed76b925cfba6d3bbb44cd49c8`. There was no unfinished work to
 discard. Read the complete supplied payload-details.json (119,568 bytes) and

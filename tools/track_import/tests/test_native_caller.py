@@ -170,6 +170,63 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(calls['scanned_bytes'],0x1000000)
 
     @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
+    def test_observed_dispatch_one_slot_and_first_block(self):
+        image=self.image(relocs=[(0x1808,0,0x600,0)])
+        decoder=native.disassembler(); before=image.stream.getvalue()
+        row=native.dispatch_details(image,decoder,native.BASE+0x1800,native.BASE+0x600)
+        self.assertEqual(row['linked_slot']['slot'],hex(native.BASE+0x1808))
+        self.assertEqual(row['stop'],'first-control-transfer')
+        self.assertEqual(row['instructions'][-1]['mnemonic'],'ret')
+        self.assertEqual(image.stream.getvalue(),before)
+        # A call ends the entry preview even if padding/another routine follows.
+        image.stream.seek(image.data_offset+0x600)
+        image.stream.write(b'\xe8\0\0\0\0\xc3')
+        row=native.dispatch_details(image,decoder,native.BASE+0x1800,native.BASE+0x600)
+        self.assertEqual(len(row['instructions']),1)
+        self.assertEqual(row['instructions'][0]['mnemonic'],'call')
+        image.stream.seek(image.data_offset+0x600); image.stream.write(b'\x90'*256)
+        row=native.dispatch_details(image,decoder,native.BASE+0x1800,native.BASE+0x600)
+        self.assertEqual(len(row['instructions']),64)
+        self.assertEqual(row['stop'],'instruction-budget')
+
+    @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
+    def test_observed_dispatch_refuses_unproven_pointer_and_code(self):
+        decoder=native.disassembler()
+        for records,patches in [([],[]), ([(0x1808,0,0x600,1)],[]),
+                               ([(0x1808,0,0x600,0)]*2,[]),
+                               ([(0x1808,0,0x600,0)],[(0x1808,b'x')]),
+                               ([(0x1808,0,0x600,0)],[(0x601,b'x')]),
+                               ([(0x1808,0,0x600,0),(0x601,0,0x600,0)],[])]:
+            image=self.image(relocs=records,patches=patches)
+            with self.assertRaises(ValueError):
+                native.dispatch_details(image,decoder,native.BASE+0x1800,native.BASE+0x600)
+        image=self.image(relocs=[(0x1808,0,0x600,0)])
+        for point in (-8,0,native.BASE+0x1801,2**64-8):
+            with self.assertRaises(ValueError): native.dispatch_details(image,decoder,point,native.BASE+0x600)
+        with self.assertRaisesRegex(ValueError,'differs from linked slot'):
+            native.dispatch_details(image,decoder,native.BASE+0x1800,native.BASE+0x700)
+
+    @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
+    def test_observed_dispatch_profile_is_exclusive_and_does_not_search(self):
+        data,patch=fixture(relocs=[(0x1808,0,0x600,0)])
+        with tempfile.TemporaryDirectory() as temp:
+            image=Path(temp)/'boot.bin'; patches=Path(temp)/'patches.bin'
+            image.write_bytes(data); patches.write_bytes(patch)
+            options=dict(dispatch_vtable=native.BASE+0x1800,dispatch_target=native.BASE+0x600)
+            with mock.patch.object(native,'GUARDS',{}), \
+                 mock.patch.object(native,'site_report',side_effect=AssertionError('repeated scan')), \
+                 mock.patch.object(native,'direct_call_candidates',side_effect=AssertionError('search')):
+                r=native.inspect(image,patches,**options)
+                self.assertEqual(r['sites'],[])
+                self.assertIn('dispatch_details',r)
+            for opts in [dict(dispatch_vtable=native.BASE+0x1800),
+                         dict(dispatch_target=native.BASE+0x600),
+                         dict(options,include_reader_details=True),
+                         dict(options,include_payload_details=True)]:
+                with self.assertRaises(ValueError): native.inspect(image,patches,**opts)
+            self.assertEqual(image.read_bytes(),data); self.assertEqual(patches.read_bytes(),patch)
+
+    @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
     def test_payload_profile_guard_and_overlap(self):
         image=self.image(); decoder=native.disassembler()
         calls=((native.BASE+0x300,native.BASE+0x600),)

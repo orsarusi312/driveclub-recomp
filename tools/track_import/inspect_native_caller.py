@@ -340,8 +340,44 @@ def digest(path):
     return h.hexdigest()
 
 
-def inspect(image_path, patch_path, include_reader_details=False, include_payload_details=False):
-    need(not (include_reader_details and include_payload_details), 'select one follow-up profile')
+def dispatch_details(image, decoder, vtable, observed_target):
+    """Check exactly the live-observed slot +8, never search for candidate tables."""
+    import capstone as cs
+    need(0 < vtable <= 2**64-16 and vtable % 8 == 0, 'invalid dispatch address point')
+    need(0 < observed_target < 2**64, 'invalid observed dispatch target')
+    pointer = image.relative_function(vtable+8)
+    target = int(pointer['target'], 16)
+    need(target == observed_target, 'dispatch target differs from linked slot: '
+         f'observed={observed_target:#x} linked={target:#x}')
+    result = {'schema': 'dc-observed-dispatch-v1', 'address_point': hex(vtable),
+              'slot_offset': '0x8', 'observed_target': hex(observed_target),
+              'linked_slot': pointer,
+              'scope': 'user-supplied runtime addresses agree with one linked slot; no object identity, resource consumption or lifetime inference',
+              'entry_scope': 'first basic block only; no call following or function-boundary claim',
+              'instructions': []}
+    # Refuse uncertain code as before, including overlaps after a short preview.
+    data = image.code(target, 256)
+    offset = 0
+    while offset < len(data) and len(result['instructions']) < 64:
+        ins = next(decoder.disasm(data[offset:offset+15], target+offset, count=1), None)
+        if ins is None:
+            result['stop'] = 'undecodable-or-truncated'; break
+        result['instructions'].extend(instructions(decoder, bytes(ins.bytes), ins.address))
+        offset += ins.size
+        if any(ins.group(g) for g in (cs.CS_GRP_CALL, cs.CS_GRP_JUMP, cs.CS_GRP_RET,
+                                     cs.CS_GRP_IRET, cs.CS_GRP_INT)) or \
+                ins.mnemonic in ('loop', 'loope', 'loopne', 'ud2', 'hlt'):
+            result['stop'] = 'first-control-transfer'; break
+    else:
+        result['stop'] = 'instruction-budget' if len(result['instructions']) == 64 else 'window-end'
+    return result
+
+
+def inspect(image_path, patch_path, include_reader_details=False, include_payload_details=False,
+            dispatch_vtable=None, dispatch_target=None):
+    need((dispatch_vtable is None) == (dispatch_target is None), 'supply dispatch vtable and target together')
+    include_dispatch = dispatch_vtable is not None
+    need(sum((include_reader_details, include_payload_details, include_dispatch)) <= 1, 'select one follow-up profile')
     before = [digest(image_path), digest(patch_path)]
     with image_path.open('rb') as stream, patch_path.open('rb') as patches:
         image = Image(stream)
@@ -356,12 +392,15 @@ def inspect(image_path, patch_path, include_reader_details=False, include_payloa
                   'image_data_file_offset': image.data_offset,
                   'limits': 'three return windows, 512 bytes each; at most four 128-byte direct targets per site',
                   'caveat': 'linked bytes before runtime fixups; supplied patch/relocation overlaps blocked; guards do not prove whole-image runtime equivalence',
-                  'sites': [] if include_payload_details else [site_report(image, address, decoder) for address in RETURNS]}
+                  'sites': [] if include_payload_details or include_dispatch else [site_report(image, address, decoder) for address in RETURNS]}
         if include_reader_details:
             report['reader_details'] = reader_details(image, decoder)
         if include_payload_details:
             report['limits'] = 'three fixed helper windows only; prior return/vtable/caller search not repeated'
             report['payload_details'] = payload_details(image, decoder)
+        if include_dispatch:
+            report['limits'] = 'one supplied vtable slot +8 and a 256-byte/64-instruction first-block preview; no search'
+            report['dispatch_details'] = dispatch_details(image, decoder, dispatch_vtable, dispatch_target)
     need(before == [digest(image_path), digest(patch_path)], 'input changed during inspection; discard report')
     return report
 
@@ -376,10 +415,15 @@ def main():
                         help='bounded static reader-vtable and initializer-caller follow-up')
     profile.add_argument('--payload-details', action='store_true',
                         help='inspect three known helper targets; do not repeat earlier searches')
+    profile.add_argument('--dispatch-vtable', type=lambda value: int(value, 0),
+                        help='address point captured at 0x80077bf2b; inspect only slot +8')
+    parser.add_argument('--dispatch-target', type=lambda value: int(value, 0),
+                        help='target observed in that same stop (required with --dispatch-vtable)')
     args = parser.parse_args()
     try:
         need(not args.output.exists(), 'output already exists; use a fresh report path')
-        report = inspect(args.image, args.patches, args.reader_details, args.payload_details)
+        report = inspect(args.image, args.patches, args.reader_details, args.payload_details,
+                         args.dispatch_vtable, args.dispatch_target)
         with args.output.open('x', encoding='utf-8') as stream:
             json.dump(report, stream, indent=2)
             stream.write('\n')
