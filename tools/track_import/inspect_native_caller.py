@@ -31,6 +31,13 @@ READER_GUARDS = {
 PAYLOAD_CALLS = ((0x80077c075, 0x8007ab640),
                  (0x80077c084, 0x8007601d0),
                  (0x80077c10c, 0x80077bec0))
+# The returned payload-details report identifies these final failure-path calls.
+# Do not assume they return into adjacent routines, or assume their callee is
+# noreturn. End each reviewed window immediately after the guarded CALL instead.
+PAYLOAD_END_CALLS = {0x8007ab640: 0x8007ab728,
+                     0x8007601d0: 0x800760239,
+                     0x80077bec0: 0x80077bfd8}
+PAYLOAD_FAILURE_TARGET = 0x80123e420
 
 
 def need(ok, message):
@@ -301,16 +308,24 @@ def reader_details(image, decoder):
 
 def payload_details(image, decoder):
     from native_control_flow import walk
-    result = {'schema': 'dc-payload-details-v1',
+    result = {'schema': 'dc-payload-details-v2',
               'scope': 'three exact helper targets; field meaning and target-resource consumption remain unproven',
-              'limits': '1024 code bytes, 256 instructions and 32 blocks per helper; no call following or image search',
+              'limits': 'reviewed entry windows (at most 1024 bytes), 256 instructions and 32 blocks per helper; no call following or image search',
               'helpers': []}
     for call, target in PAYLOAD_CALLS:
         expected = b'\xe8'+struct.pack('<i', target-(call+5))
         need(image.code(call, 5) == expected, 'payload-details call guard mismatch at '+hex(call))
         row = {'call_evidence': hex(call), 'target': hex(target)}
         try:
-            row.update(walk(image.code(target, 1024), target, decoder))
+            end_call = PAYLOAD_END_CALLS[target]
+            size = end_call+5-target
+            need(0 < size <= 1024, 'invalid reviewed helper window')
+            expected_end = b'\xe8'+struct.pack('<i', PAYLOAD_FAILURE_TARGET-(end_call+5))
+            need(image.code(end_call, 5) == expected_end,
+                 'payload-details end-call guard mismatch at '+hex(end_call))
+            row['boundary'] = {'end_exclusive': hex(end_call+5), 'last_call': hex(end_call),
+                               'scope': 'reviewed entry window ends after failure-path call; callee return behavior unproven; adjacent routines excluded'}
+            row.update(walk(image.code(target, size), target, decoder))
         except ValueError as exc:
             row['blocked'] = str(exc)
         result['helpers'].append(row)

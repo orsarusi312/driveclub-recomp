@@ -175,7 +175,11 @@ class ImageTests(unittest.TestCase):
         calls=((native.BASE+0x300,native.BASE+0x600),)
         image.stream.seek(image.data_offset+0x300)
         image.stream.write(b'\xe8'+struct.pack('<i',0x600-0x305))
-        with mock.patch.object(native,'PAYLOAD_CALLS',calls):
+        end_call=native.BASE+0x680
+        image.stream.seek(image.data_offset+0x680)
+        image.stream.write(b'\xe8'+struct.pack('<i',native.PAYLOAD_FAILURE_TARGET-(end_call+5)))
+        with mock.patch.object(native,'PAYLOAD_CALLS',calls), \
+             mock.patch.object(native,'PAYLOAD_END_CALLS',{native.BASE+0x600:end_call}):
             result=native.payload_details(image,decoder)
             self.assertEqual(result['helpers'][0]['instructions'][-1]['mnemonic'],'ret')
             image.patches=[(0x600,1)]
@@ -186,6 +190,36 @@ class ImageTests(unittest.TestCase):
             image.patches=[]
             with self.assertRaisesRegex(ValueError,'call guard mismatch'):
                 native.payload_details(image,decoder)
+
+    @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
+    def test_payload_reviewed_boundary_excludes_adjacent_routine(self):
+        image=self.image(); decoder=native.disassembler()
+        target=native.BASE+0x600; end_call=target+0x80
+        image.stream.seek(image.data_offset+0x300)
+        image.stream.write(b'\xe8'+struct.pack('<i',target-(native.BASE+0x305)))
+        image.stream.seek(image.data_offset+0x600)
+        image.stream.write(b'\xe9'+struct.pack('<i',end_call-(target+5)))
+        image.stream.seek(image.data_offset+0x680)
+        tail=b'\xe8'+struct.pack('<i',native.PAYLOAD_FAILURE_TARGET-(end_call+5))
+        image.stream.write(tail+bytes.fromhex('554889e5c3'))
+        with mock.patch.object(native,'PAYLOAD_CALLS',((native.BASE+0x300,target),)), \
+             mock.patch.object(native,'PAYLOAD_END_CALLS',{target:end_call}):
+            # An adjacent routine's patch is outside the reviewed window. No
+            # permission/overlap rule is relaxed for the bytes actually decoded.
+            image.patches=[(0x685,1)]
+            row=native.payload_details(image,decoder)['helpers'][0]
+            self.assertEqual(row['window_bytes'],0x85)
+            self.assertEqual([i['address'] for i in row['instructions']],
+                             [hex(target),hex(end_call)])
+            self.assertEqual(row['stops'][0]['reason'],'window-end-fallthrough')
+            self.assertEqual(row['boundary']['end_exclusive'],hex(end_call+5))
+            image.patches=[(0x684,1)]
+            self.assertIn('blocked',native.payload_details(image,decoder)['helpers'][0])
+            image.patches=[]; image.relocations=[0x67f]
+            self.assertIn('blocked',native.payload_details(image,decoder)['helpers'][0])
+            image.relocations=[]
+            image.stream.seek(image.data_offset+0x680); image.stream.write(b'\x90')
+            self.assertIn('end-call guard mismatch',native.payload_details(image,decoder)['helpers'][0]['blocked'])
 
     @unittest.skipUnless(importlib.util.find_spec('capstone'), 'optional offline decoder needs capstone==5.0.6')
     def test_payload_profile_does_not_repeat_prior_searches(self):

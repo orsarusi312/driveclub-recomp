@@ -1,5 +1,8 @@
 # Road742: prioritized caller paths and missing payload helpers
 
+> Follow-up: [returned helper semantics and the unresolved selection edge](external-track-selection-edge.md).
+> The helper inspection succeeded on Windows; it does not need to be repeated.
+
 Continued the clean branch at `a58fd3988ca9407e22d478c38b3f2bf4d1f6256e`.
 The uploaded reader-details.json (239,641 bytes) retains the prior image and patch
 hashes; its four vtable slots resolved and its search stopped at eight candidates
