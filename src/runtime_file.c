@@ -398,6 +398,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     const uint64_t started=file_now_us();
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
+    rpk_trace_before_open(guest); /* Opt-in, before any host open or fd publication. */
 #ifdef _WIN32
     /* Windows cannot open a directory as a CRT descriptor: directories are listings only. */
     (void)mode;

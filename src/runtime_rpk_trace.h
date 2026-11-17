@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include "runtime_rpk_debug.h"
+#include "runtime_rpk_open_debug.h"
 
 typedef struct { uint64_t id, offset, size; } RpkTraceSpan;
 typedef struct { uint64_t id,offset,stride,width,samples; unsigned char bytes[96]; } RpkTracePrefix;
@@ -110,6 +111,21 @@ static void rpk_trace_init(void) {
 static int rpk_trace_watches(const char *path) {
     pthread_once(&rpk_trace_once,rpk_trace_init);
     return rpk_trace_config.count && !strcmp(path,rpk_trace_config.path);
+}
+static inline void rpk_trace_before_open(const char *path) {
+    if(!rpk_open_debug_enabled(BB_DIAGNOSTIC_ENV("BB_RPK_DEBUG_OPEN"))) return;
+    const int saved_errno=errno;
+#ifdef _WIN32
+    const DWORD saved_error=GetLastError();
+#endif
+    static RpkOpenDebugState state=RPK_OPEN_DEBUG_STATE;
+    const RpkOpenDebugOps ops={rpk_debug_attached,rpk_open_debug_pause};
+    if(rpk_trace_watches(path))
+        rpk_open_debug_dispatch(&state,1,rpk_trace_config.path,path,&ops);
+#ifdef _WIN32
+    SetLastError(saved_error);
+#endif
+    errno=saved_errno;
 }
 extern int runtime_memory_read_backing(uintptr_t,void*,uint64_t);
 static const char *rpk_trace_check_prefix(const RpkTracePrefix *q,uint64_t id,uint64_t at,uint64_t length,

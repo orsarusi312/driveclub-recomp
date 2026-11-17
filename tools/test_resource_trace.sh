@@ -7,6 +7,8 @@ cxx=${CXX:-clang++}; command -v "$cxx" >/dev/null || cxx=g++
 flags=(-O1 -g -Wall -Wextra -Werror -UNDEBUG -pthread)
 if [[ ${SANITIZE:-0} == 1 ]]; then flags+=(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-pie -no-pie); fi
 for mode in 0 1; do
+    "$cc" -std=c11 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/rpk_open_debug_test.c -o out/tests/rpk-open-debug-$mode.exe
+    out/tests/rpk-open-debug-$mode.exe
     "$cc" -std=c11 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/rpk_request_test.c -o out/tests/rpk-request-$mode.exe
     out/tests/rpk-request-$mode.exe
     "$cc" -std=c11 "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/rpk_read_watch_test.c -o out/tests/rpk-read-watch-$mode.exe

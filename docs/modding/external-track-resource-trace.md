@@ -1,4 +1,6 @@
-> Latest decision: [final destination slot and one Road742 transfer test](external-track-destination-decision.md).
+> Latest experiment: [arm before the first RPK open](external-track-early-open.md).
+
+> Previous decision: [final destination slot and one Road742 transfer test](external-track-destination-decision.md).
 
 > Previous experiment: [exact vertex setup slots and reader byte-count edge](external-track-vertex-transfer.md).
 
