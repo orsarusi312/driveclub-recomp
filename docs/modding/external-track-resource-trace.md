@@ -1,4 +1,6 @@
-> Latest experiment: [exact vertex setup slots and reader byte-count edge](external-track-vertex-transfer.md).
+> Latest decision: [final destination slot and one Road742 transfer test](external-track-destination-decision.md).
+
+> Previous experiment: [exact vertex setup slots and reader byte-count edge](external-track-vertex-transfer.md).
 
 > Previous experiment: [0x78-byte object parser and common-header connection](external-track-vertex-parser.md).
 

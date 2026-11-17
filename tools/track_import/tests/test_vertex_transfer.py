@@ -83,6 +83,60 @@ class VertexTransferTests(unittest.TestCase):
                 with self.assertRaises(ValueError): native.inspect(p,q,include_vertex_transfer=True,**extra)
             self.assertEqual(p.read_bytes(),data); self.assertEqual(q.read_bytes(),patch)
 
+    def destination_fixture(self):
+        image,patch,options=self.fixture()
+        image.relocation_records.append((0x1838,0,0xe00,0))
+        options['TRANSFER_DESTINATION_THUNK']=native.BASE+0xc00
+        image.stream.seek(image.data_offset+0xc00)
+        image.stream.write(bytes.fromhex('4589c14189c889d1488b17488b423831d2ffe0'))
+        # Synthetic destination preparation, not a prediction of the native target.
+        image.stream.seek(image.data_offset+0xe00)
+        image.stream.write(bytes.fromhex('488b475848890644894608c3'))
+        return image,patch,options
+
+    def test_destination_only_reads_one_method_and_never_prior_helpers(self):
+        image,_,options=self.destination_fixture(); before=image.stream.getvalue()
+        with mock.patch.multiple(native,**options), mock.patch.object(image,'code',wraps=image.code) as reads:
+            r=native.vertex_transfer_details(image,native.disassembler(),True)
+        self.assertNotIn('blocked',r)
+        self.assertEqual(r['destination_slot']['slot'],hex(native.BASE+0x1838))
+        self.assertEqual(r['destination_slot']['code']['decoded_bytes'],12)
+        self.assertEqual(reads.call_args_list,[mock.call(native.BASE+0x200,14),
+                         mock.call(native.BASE+0x220,3),mock.call(native.BASE+0xc00,19),
+                         mock.call(native.BASE+0xe00,512)])
+        self.assertEqual(image.stream.getvalue(),before)
+
+    def test_destination_parent_and_thunk_fail_closed(self):
+        for kind in ('wrong-parent','wrong-thunk','patched-thunk','missing-parent'):
+            image,_,options=self.destination_fixture()
+            if kind=='wrong-parent': image.relocation_records[0]=(0x1830,0,0xa00,0)
+            if kind=='missing-parent': image.relocation_records=image.relocation_records[1:]
+            if kind=='patched-thunk': image.patches=[(0xc02,1)]
+            if kind=='wrong-thunk':
+                image.stream.seek(image.data_offset+0xc00); image.stream.write(b'\x90')
+            with mock.patch.multiple(native,**options):
+                r=native.vertex_transfer_details(image,native.disassembler(),True)
+            self.assertIn('blocked',r); self.assertNotIn('destination_slot',r)
+
+    def test_destination_metadata_and_window_protections(self):
+        for records,patches in [([],[]), ([(0x1838,0,0xe00,0)]*2,[]),
+              ([(0x1837,0,0xe00,0)],[]), ([(0x1838,1,0xe00,0)],[]),
+              ([(0x1838,0,0xe00,1)],[]), ([(0x1838,0,0x1800,0)],[]),
+              ([(0x1838,0,0xe00,0)],[(0x1838,1)]),
+              ([(0x1838,0,0xe00,0)],[(0xe00,1)]),
+              ([(0x1838,0,0xf00,0)],[])]:
+            image,_,options=self.destination_fixture()
+            image.relocation_records=image.relocation_records[:1]+records
+            image.patches=patches
+            with mock.patch.multiple(native,**options):
+                r=native.vertex_transfer_details(image,native.disassembler(),True)
+            self.assertIn('blocked',r)
+            self.assertNotIn('code',r.get('destination_slot',{}))
+
+    def test_destination_modifier_requires_transfer_profile(self):
+        with self.assertRaisesRegex(ValueError,'requires --vertex-transfer'):
+            native.inspect(Path('not-opened'),Path('not-opened'),destination_only=True)
+
 
 if __name__ == '__main__':
     unittest.main()

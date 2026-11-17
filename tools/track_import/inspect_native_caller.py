@@ -48,6 +48,7 @@ VERTEX_BASE_PARSER = 0x8007730c0
 VERTEX_BRIDGE_RETURN_CANDIDATE = 0x8007595ff
 TRANSFER_VTABLE_LOAD = 0x80075916a
 TRANSFER_VTABLE = 0x8015ede50
+TRANSFER_DESTINATION_THUNK = 0x8007593e0
 TRANSFER_VIRTUAL_SITES = ((0x80075920a, 0x30), (0x800759228, 0x40))
 # Only direct dependencies visible in the returned vertex-parser report.
 TRANSFER_CALLS = ((0x800759165, 0x800742b70, 512),
@@ -470,12 +471,37 @@ def vertex_parser_details(image, decoder):
     return result
 
 
-def vertex_transfer_details(image, decoder):
+def vertex_transfer_details(image, decoder, destination_only=False):
     from native_control_flow import walk
     displacement = TRANSFER_VTABLE-0x10-(TRANSFER_VTABLE_LOAD+7)
     expected = b'\x48\x8d\x05'+struct.pack('<i', displacement)+bytes.fromhex('4883c010488903')
     need(image.code(TRANSFER_VTABLE_LOAD, len(expected)) == expected,
          'vertex-transfer vtable-store guard mismatch at '+hex(TRANSFER_VTABLE_LOAD))
+    if destination_only:
+        # Final exact-slot follow-up, not a recursive vtable/call-graph search.
+        call, offset = TRANSFER_VIRTUAL_SITES[0]
+        need(offset == 0x30 and image.code(call, 3) == bytes.fromhex('ff5030'),
+             'vertex-transfer parent virtual-call guard mismatch')
+        result = {'schema': 'dc-vertex-destination-v1',
+                  'stored_address_point': hex(TRANSFER_VTABLE),
+                  'limits': 'one exact +0x38 slot; 512 code bytes/256 instructions/32 blocks; no dependencies followed',
+                  'scope': 'static destination preparation candidate; no live Road742 transfer or ownership claim'}
+        try:
+            parent = image.relative_function(TRANSFER_VTABLE+0x30)
+            result['parent_slot'] = parent
+            need(int(parent['target'], 16) == TRANSFER_DESTINATION_THUNK,
+                 'destination parent target differs from verified report')
+            need(image.code(TRANSFER_DESTINATION_THUNK, 19) ==
+                 bytes.fromhex('4589c14189c889d1488b17488b423831d2ffe0'),
+                 'destination forwarding-thunk guard mismatch')
+            row = image.relative_function(TRANSFER_VTABLE+0x38)
+            result['destination_slot'] = row
+            row['code'] = walk(image.code(int(row['target'], 16), 512),
+                               int(row['target'], 16), decoder,
+                               stop_at_call_targets=(PAYLOAD_FAILURE_TARGET,))
+        except ValueError as exc:
+            result['blocked'] = str(exc)
+        return result
     for call, target, size in TRANSFER_CALLS:
         need(image.code(call, 5) == b'\xe8'+struct.pack('<i', target-call-5),
              'vertex-transfer direct-call guard mismatch at '+hex(call))
@@ -514,7 +540,8 @@ def vertex_transfer_details(image, decoder):
 
 def inspect(image_path, patch_path, include_reader_details=False, include_payload_details=False,
             dispatch_vtable=None, dispatch_target=None, include_resource_consumer=False,
-            include_vertex_parser=False, include_vertex_transfer=False):
+            include_vertex_parser=False, include_vertex_transfer=False, destination_only=False):
+    need(not destination_only or include_vertex_transfer, '--destination-only requires --vertex-transfer')
     need((dispatch_vtable is None) == (dispatch_target is None), 'supply dispatch vtable and target together')
     include_dispatch = dispatch_vtable is not None
     need(sum((include_reader_details, include_payload_details, include_dispatch, include_resource_consumer,
@@ -551,7 +578,7 @@ def inspect(image_path, patch_path, include_reader_details=False, include_payloa
             report['vertex_parser'] = vertex_parser_details(image, decoder)
         if include_vertex_transfer:
             report['limits'] = 'vertex transfer dependencies only; no previous profiles or image searches repeated'
-            report['vertex_transfer'] = vertex_transfer_details(image, decoder)
+            report['vertex_transfer'] = vertex_transfer_details(image, decoder, destination_only)
     need(before == [digest(image_path), digest(patch_path)], 'input changed during inspection; discard report')
     return report
 
@@ -574,6 +601,8 @@ def main():
                         help='inspect only 0x759140 and one guarded lead toward the common header parser')
     profile.add_argument('--vertex-transfer', action='store_true',
                         help='resolve two stored-vtable slots and inspect five fixed buffer/read dependencies')
+    parser.add_argument('--destination-only', action='store_true',
+                        help='with --vertex-transfer, inspect only guarded +0x38 destination method; no previous helper windows')
     parser.add_argument('--dispatch-target', type=lambda value: int(value, 0),
                         help='target observed in that same stop (required with --dispatch-vtable)')
     args = parser.parse_args()
@@ -581,7 +610,7 @@ def main():
         need(not args.output.exists(), 'output already exists; use a fresh report path')
         report = inspect(args.image, args.patches, args.reader_details, args.payload_details,
                          args.dispatch_vtable, args.dispatch_target, args.resource_consumer, args.vertex_parser,
-                         args.vertex_transfer)
+                         args.vertex_transfer, args.destination_only)
         with args.output.open('x', encoding='utf-8') as stream:
             json.dump(report, stream, indent=2)
             stream.write('\n')

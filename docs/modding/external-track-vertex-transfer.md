@@ -1,5 +1,10 @@
 # Vertex setup: exact virtual slots and the reader byte-count edge
 
+> Completed: the Windows vertex-transfer report closed the initialization and
+> reader-forwarding edges. Continue with the [single destination slot and
+> instance-specific transfer decision](external-track-destination-decision.md).
+> Do not repeat the five successful helper inspections.
+
 Continued clean local/remote `feat/external-track-foundation` at
 `99d7c1e0a817df3c3f5550836c21f2b6f2b49ff9`; no unfinished changes were present.
 Read the complete supplied vertex-parser.json (41,120 bytes). Input hashes match
