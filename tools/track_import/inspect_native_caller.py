@@ -46,6 +46,15 @@ CONSUMER_ID_HELPER = 0x800760240
 VERTEX_PARSER_CALL = (0x800739c3e, 0x800759140)
 VERTEX_BASE_PARSER = 0x8007730c0
 VERTEX_BRIDGE_RETURN_CANDIDATE = 0x8007595ff
+TRANSFER_VTABLE_LOAD = 0x80075916a
+TRANSFER_VTABLE = 0x8015ede50
+TRANSFER_VIRTUAL_SITES = ((0x80075920a, 0x30), (0x800759228, 0x40))
+# Only direct dependencies visible in the returned vertex-parser report.
+TRANSFER_CALLS = ((0x800759165, 0x800742b70, 512),
+                  (0x8007591a8, 0x800753bf0, 512),
+                  (0x80075921d, 0x8007abd00, 512),
+                  (0x8007591ed, 0x800b4b2d0, 256),
+                  (0x80075965a, 0x800760160, 128))
 
 
 def need(ok, message):
@@ -461,13 +470,55 @@ def vertex_parser_details(image, decoder):
     return result
 
 
+def vertex_transfer_details(image, decoder):
+    from native_control_flow import walk
+    displacement = TRANSFER_VTABLE-0x10-(TRANSFER_VTABLE_LOAD+7)
+    expected = b'\x48\x8d\x05'+struct.pack('<i', displacement)+bytes.fromhex('4883c010488903')
+    need(image.code(TRANSFER_VTABLE_LOAD, len(expected)) == expected,
+         'vertex-transfer vtable-store guard mismatch at '+hex(TRANSFER_VTABLE_LOAD))
+    for call, target, size in TRANSFER_CALLS:
+        need(image.code(call, 5) == b'\xe8'+struct.pack('<i', target-call-5),
+             'vertex-transfer direct-call guard mismatch at '+hex(call))
+    for call, offset in TRANSFER_VIRTUAL_SITES:
+        need(image.code(call, 3) == bytes((0xff, 0x50, offset)),
+             'vertex-transfer virtual-call guard mismatch at '+hex(call))
+    result = {'schema': 'dc-vertex-transfer-v1', 'stored_address_point': hex(TRANSFER_VTABLE),
+              'vtable_store_guard': hex(TRANSFER_VTABLE_LOAD),
+              'scope': 'static slots conditional on the object retaining its stored vptr; no live dispatch, transfer, GPU ownership or Road742 claim',
+              'limits': 'five fixed direct targets (512/512/512/256/128 bytes) and two exact slots (512-byte targets); no scans or recursive following',
+              'direct_helpers': [], 'virtual_slots': [],
+              'reviewed_call_boundary': hex(PAYLOAD_FAILURE_TARGET)}
+    cache = {}
+    def preview(target, size):
+        key = (target, size)
+        if key not in cache:
+            try:
+                cache[key] = walk(image.code(target, size), target, decoder,
+                                  stop_at_call_targets=(PAYLOAD_FAILURE_TARGET,))
+            except ValueError as exc:
+                cache[key] = {'blocked': str(exc)}
+        return cache[key]
+    for call, target, size in TRANSFER_CALLS:
+        result['direct_helpers'].append({'call_evidence': hex(call), 'target': hex(target),
+                                         'code': preview(target, size)})
+    for call, offset in TRANSFER_VIRTUAL_SITES:
+        row = {'call_evidence': hex(call), 'offset': hex(offset)}
+        try:
+            row.update(image.relative_function(TRANSFER_VTABLE+offset))
+            row['code'] = preview(int(row['target'], 16), 512)
+        except ValueError as exc:
+            row['blocked'] = str(exc)
+        result['virtual_slots'].append(row)
+    return result
+
+
 def inspect(image_path, patch_path, include_reader_details=False, include_payload_details=False,
             dispatch_vtable=None, dispatch_target=None, include_resource_consumer=False,
-            include_vertex_parser=False):
+            include_vertex_parser=False, include_vertex_transfer=False):
     need((dispatch_vtable is None) == (dispatch_target is None), 'supply dispatch vtable and target together')
     include_dispatch = dispatch_vtable is not None
     need(sum((include_reader_details, include_payload_details, include_dispatch, include_resource_consumer,
-              include_vertex_parser)) <= 1,
+              include_vertex_parser, include_vertex_transfer)) <= 1,
          'select one follow-up profile')
     before = [digest(image_path), digest(patch_path)]
     with image_path.open('rb') as stream, patch_path.open('rb') as patches:
@@ -483,7 +534,7 @@ def inspect(image_path, patch_path, include_reader_details=False, include_payloa
                   'image_data_file_offset': image.data_offset,
                   'limits': 'three return windows, 512 bytes each; at most four 128-byte direct targets per site',
                   'caveat': 'linked bytes before runtime fixups; supplied patch/relocation overlaps blocked; guards do not prove whole-image runtime equivalence',
-                  'sites': [] if include_payload_details or include_dispatch or include_resource_consumer or include_vertex_parser else [site_report(image, address, decoder) for address in RETURNS]}
+                  'sites': [] if include_payload_details or include_dispatch or include_resource_consumer or include_vertex_parser or include_vertex_transfer else [site_report(image, address, decoder) for address in RETURNS]}
         if include_reader_details:
             report['reader_details'] = reader_details(image, decoder)
         if include_payload_details:
@@ -498,6 +549,9 @@ def inspect(image_path, patch_path, include_reader_details=False, include_payloa
         if include_vertex_parser:
             report['limits'] = 'vertex-parser follow-up only; successful earlier profiles not repeated'
             report['vertex_parser'] = vertex_parser_details(image, decoder)
+        if include_vertex_transfer:
+            report['limits'] = 'vertex transfer dependencies only; no previous profiles or image searches repeated'
+            report['vertex_transfer'] = vertex_transfer_details(image, decoder)
     need(before == [digest(image_path), digest(patch_path)], 'input changed during inspection; discard report')
     return report
 
@@ -518,13 +572,16 @@ def main():
                         help='inspect confirmed 0x742db0 -> 0x739c10 and one ID-helper caller lead offline')
     profile.add_argument('--vertex-parser', action='store_true',
                         help='inspect only 0x759140 and one guarded lead toward the common header parser')
+    profile.add_argument('--vertex-transfer', action='store_true',
+                        help='resolve two stored-vtable slots and inspect five fixed buffer/read dependencies')
     parser.add_argument('--dispatch-target', type=lambda value: int(value, 0),
                         help='target observed in that same stop (required with --dispatch-vtable)')
     args = parser.parse_args()
     try:
         need(not args.output.exists(), 'output already exists; use a fresh report path')
         report = inspect(args.image, args.patches, args.reader_details, args.payload_details,
-                         args.dispatch_vtable, args.dispatch_target, args.resource_consumer, args.vertex_parser)
+                         args.dispatch_vtable, args.dispatch_target, args.resource_consumer, args.vertex_parser,
+                         args.vertex_transfer)
         with args.output.open('x', encoding='utf-8') as stream:
             json.dump(report, stream, indent=2)
             stream.write('\n')

@@ -1,4 +1,6 @@
-> Latest experiment: [0x78-byte object parser and common-header connection](external-track-vertex-parser.md).
+> Latest experiment: [exact vertex setup slots and reader byte-count edge](external-track-vertex-transfer.md).
+
+> Previous experiment: [0x78-byte object parser and common-header connection](external-track-vertex-parser.md).
 
 > Previous experiment: [confirmed resource-ID consumption and native parser follow-up](external-track-resource-consumer.md).
 

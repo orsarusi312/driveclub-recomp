@@ -1,5 +1,9 @@
 # Offline follow-up: the 0x78-byte parser candidate
 
+> Completed: the vertex-parser report succeeded. Continue with the [exact vtable
+> slots and buffer/read dependencies](external-track-vertex-transfer.md). Do not
+> repeat this profile or the successful resource-ID runtime experiment.
+
 Recovered a clean local/remote branch at
 `a7dc250578b4a9115ad934f61412ccdef52e12f1`. Read the complete supplied
 resource-consumer.json (28,722 bytes); its prepared-image/patch hashes match the
