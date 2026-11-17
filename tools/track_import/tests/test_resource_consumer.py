@@ -75,6 +75,63 @@ class ResourceConsumerTests(unittest.TestCase):
                 with self.assertRaises(ValueError): native.inspect(p,q,include_resource_consumer=True,**extra)
             self.assertEqual(p.read_bytes(),data); self.assertEqual(q.read_bytes(),patch)
 
+    def vertex_fixture(self):
+        image,patch,options=self.fixture()
+        def call(at,target):
+            image.stream.seek(image.data_offset+at)
+            image.stream.write(b'\xe8'+struct.pack('<i',target-at-5))
+        call(0x320,0x600); call(0x620,0x450); call(0x625,0xb80)
+        image.stream.write(b'\xc3')
+        options.update(VERTEX_PARSER_CALL=(native.BASE+0x320,native.BASE+0x600),
+                       VERTEX_BASE_PARSER=native.BASE+0xb80,
+                       VERTEX_BRIDGE_RETURN_CANDIDATE=native.BASE+0x480)
+        return image,patch,options
+
+    def test_vertex_parser_static_edges_are_bounded_candidates(self):
+        image,_,options=self.vertex_fixture(); before=image.stream.getvalue()
+        with mock.patch.multiple(native,**options):
+            r=native.vertex_parser_details(image,native.disassembler())
+        self.assertEqual(r['entry']['window_bytes'],1024)
+        self.assertEqual(r['direct_base_parser_calls'][0]['at'],hex(native.BASE+0x625))
+        self.assertEqual(r['calls_to_bridge_leads'][0]['entry_candidate'],hex(native.BASE+0x450))
+        self.assertEqual(r['calls_to_bridge_leads'][0]['call']['at'],hex(native.BASE+0x620))
+        self.assertEqual(image.stream.getvalue(),before)
+
+    def test_vertex_parser_refusals_do_not_make_false_edges(self):
+        image,_,options=self.vertex_fixture(); decoder=native.disassembler()
+        with mock.patch.multiple(native,**options):
+            image.patches=[(0x320,1)]
+            with self.assertRaises(ValueError): native.vertex_parser_details(image,decoder)
+            image.patches=[(0x601,1)]
+            r=native.vertex_parser_details(image,decoder)
+            self.assertIn('blocked',r['entry']); self.assertEqual(r['calls_to_bridge_leads'],[])
+            image.patches=[]; image.relocations=[0x620]
+            self.assertIn('blocked',native.vertex_parser_details(image,decoder)['entry'])
+            image.relocations=[]; image.patches=[(0x47b,1)]
+            r=native.vertex_parser_details(image,decoder)
+            self.assertIn('blocked',r['bridge_candidate']); self.assertEqual(r['calls_to_bridge_leads'],[])
+            image.patches=[]
+            image.stream.seek(image.data_offset+0x320); image.stream.write(b'\x90')
+            with self.assertRaisesRegex(ValueError,'caller guard mismatch'):
+                native.vertex_parser_details(image,decoder)
+
+    def test_vertex_profile_preserves_inputs_and_excludes_prior_profiles(self):
+        image,patch,options=self.vertex_fixture(); data=image.stream.getvalue()
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'image'; q=Path(folder)/'patch'
+            p.write_bytes(data); q.write_bytes(patch)
+            with mock.patch.multiple(native,**options), mock.patch.object(native,'GUARDS',{}), \
+                 mock.patch.object(native,'resource_consumer_details',side_effect=AssertionError('repeat')), \
+                 mock.patch.object(native,'site_report',side_effect=AssertionError('repeat')), \
+                 mock.patch.object(native,'direct_call_candidates',side_effect=AssertionError('search')):
+                r=native.inspect(p,q,include_vertex_parser=True)
+                self.assertEqual(r['sites'],[]); self.assertIn('vertex_parser',r)
+            for extra in [dict(include_reader_details=True),dict(include_payload_details=True),
+                          dict(include_resource_consumer=True),
+                          dict(dispatch_vtable=native.BASE+0x1800,dispatch_target=native.BASE+0x600)]:
+                with self.assertRaises(ValueError): native.inspect(p,q,include_vertex_parser=True,**extra)
+            self.assertEqual(p.read_bytes(),data); self.assertEqual(q.read_bytes(),patch)
+
 
 if __name__ == '__main__':
     unittest.main()

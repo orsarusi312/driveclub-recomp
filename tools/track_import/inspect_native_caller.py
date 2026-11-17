@@ -43,6 +43,9 @@ CONSUMER_TARGET = 0x800742db0
 CONSUMER_HELPER_CALL = (0x800742de2, 0x800739c10)
 CONSUMER_ID_RETURN_CANDIDATE = 0x8007730fa
 CONSUMER_ID_HELPER = 0x800760240
+VERTEX_PARSER_CALL = (0x800739c3e, 0x800759140)
+VERTEX_BASE_PARSER = 0x8007730c0
+VERTEX_BRIDGE_RETURN_CANDIDATE = 0x8007595ff
 
 
 def need(ok, message):
@@ -399,13 +402,18 @@ def resource_consumer_details(image, decoder):
         except ValueError as exc:
             row['blocked'] = str(exc)
         result['windows'].append(row)
-    ret = CONSUMER_ID_RETURN_CANDIDATE
+    result['id_reader_caller_candidate'] = bounded_call_candidate(
+        image, decoder, CONSUMER_ID_RETURN_CANDIDATE, CONSUMER_ID_HELPER, 'ID-helper')
+    return result
+
+
+def bounded_call_candidate(image, decoder, ret, expected_target, label):
+    from native_control_flow import walk
     candidate = {'return_candidate': hex(ret),
                  'scope': 'lead from raw kv stack display, not a verified frame return or executed call'}
-    result['id_reader_caller_candidate'] = candidate
     try:
-        expected = b'\xe8'+struct.pack('<i', CONSUMER_ID_HELPER-ret)
-        need(image.code(ret-5, 5) == expected, 'candidate is not the expected direct ID-helper call')
+        expected = b'\xe8'+struct.pack('<i', expected_target-ret)
+        need(image.code(ret-5, 5) == expected, 'candidate is not the expected direct '+label+' call')
         data = image.code(ret-128, 384)
         candidate['call_encoding_matches'] = True
         candidate['forward_from_return'] = walk(data[128:], ret, decoder,
@@ -422,14 +430,44 @@ def resource_consumer_details(image, decoder):
             candidate['prologue_leads'].append(lead)
     except ValueError as exc:
         candidate['blocked'] = str(exc)
+    return candidate
+
+
+def vertex_parser_details(image, decoder):
+    from native_control_flow import walk
+    call, target = VERTEX_PARSER_CALL
+    need(image.code(call, 5) == b'\xe8'+struct.pack('<i', target-(call+5)),
+         'vertex-parser caller guard mismatch at '+hex(call))
+    result = {'schema': 'dc-vertex-parser-v1', 'call_evidence': hex(call), 'target': hex(target),
+              'scope': 'static parser candidate for the observed selector-3 path; no Road742 consumption, allocation success or GPU claim',
+              'limits': 'one 1024-byte entry window and one guarded 384-byte caller-lead window; no executable search or recursive call following',
+              'entry': {'target': hex(target)}}
+    try:
+        result['entry'].update(walk(image.code(target, 1024), target, decoder,
+                                    stop_at_call_targets=(PAYLOAD_FAILURE_TARGET,)))
+    except ValueError as exc:
+        result['entry']['blocked'] = str(exc)
+    bridge = bounded_call_candidate(image, decoder, VERTEX_BRIDGE_RETURN_CANDIDATE,
+                                    VERTEX_BASE_PARSER, 'base-parser')
+    result['bridge_candidate'] = bridge
+    calls = result['entry'].get('calls', [])
+    result['direct_base_parser_calls'] = [c for c in calls if c['target'] == hex(VERTEX_BASE_PARSER)]
+    result['calls_to_bridge_leads'] = [
+        {'call': c, 'entry_candidate': lead['entry'], 'scope': 'static edge to a prologue lead; execution unproven'}
+        for lead in bridge.get('prologue_leads', []) if lead['call_boundary_matches']
+        for c in calls if c['target'] == lead['entry']]
+    result['reviewed_call_boundary'] = hex(PAYLOAD_FAILURE_TARGET)
+    result['boundary_caveat'] = 'walk stops at this failure-path call without assuming it cannot return'
     return result
 
 
 def inspect(image_path, patch_path, include_reader_details=False, include_payload_details=False,
-            dispatch_vtable=None, dispatch_target=None, include_resource_consumer=False):
+            dispatch_vtable=None, dispatch_target=None, include_resource_consumer=False,
+            include_vertex_parser=False):
     need((dispatch_vtable is None) == (dispatch_target is None), 'supply dispatch vtable and target together')
     include_dispatch = dispatch_vtable is not None
-    need(sum((include_reader_details, include_payload_details, include_dispatch, include_resource_consumer)) <= 1,
+    need(sum((include_reader_details, include_payload_details, include_dispatch, include_resource_consumer,
+              include_vertex_parser)) <= 1,
          'select one follow-up profile')
     before = [digest(image_path), digest(patch_path)]
     with image_path.open('rb') as stream, patch_path.open('rb') as patches:
@@ -445,7 +483,7 @@ def inspect(image_path, patch_path, include_reader_details=False, include_payloa
                   'image_data_file_offset': image.data_offset,
                   'limits': 'three return windows, 512 bytes each; at most four 128-byte direct targets per site',
                   'caveat': 'linked bytes before runtime fixups; supplied patch/relocation overlaps blocked; guards do not prove whole-image runtime equivalence',
-                  'sites': [] if include_payload_details or include_dispatch or include_resource_consumer else [site_report(image, address, decoder) for address in RETURNS]}
+                  'sites': [] if include_payload_details or include_dispatch or include_resource_consumer or include_vertex_parser else [site_report(image, address, decoder) for address in RETURNS]}
         if include_reader_details:
             report['reader_details'] = reader_details(image, decoder)
         if include_payload_details:
@@ -457,6 +495,9 @@ def inspect(image_path, patch_path, include_reader_details=False, include_payloa
         if include_resource_consumer:
             report['limits'] = 'confirmed resource consumer follow-up only; no earlier profiles or image searches repeated'
             report['resource_consumer'] = resource_consumer_details(image, decoder)
+        if include_vertex_parser:
+            report['limits'] = 'vertex-parser follow-up only; successful earlier profiles not repeated'
+            report['vertex_parser'] = vertex_parser_details(image, decoder)
     need(before == [digest(image_path), digest(patch_path)], 'input changed during inspection; discard report')
     return report
 
@@ -475,13 +516,15 @@ def main():
                         help='address point captured at 0x80077bf2b; inspect only slot +8')
     profile.add_argument('--resource-consumer', action='store_true',
                         help='inspect confirmed 0x742db0 -> 0x739c10 and one ID-helper caller lead offline')
+    profile.add_argument('--vertex-parser', action='store_true',
+                        help='inspect only 0x759140 and one guarded lead toward the common header parser')
     parser.add_argument('--dispatch-target', type=lambda value: int(value, 0),
                         help='target observed in that same stop (required with --dispatch-vtable)')
     args = parser.parse_args()
     try:
         need(not args.output.exists(), 'output already exists; use a fresh report path')
         report = inspect(args.image, args.patches, args.reader_details, args.payload_details,
-                         args.dispatch_vtable, args.dispatch_target, args.resource_consumer)
+                         args.dispatch_vtable, args.dispatch_target, args.resource_consumer, args.vertex_parser)
         with args.output.open('x', encoding='utf-8') as stream:
             json.dump(report, stream, indent=2)
             stream.write('\n')

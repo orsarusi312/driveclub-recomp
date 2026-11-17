@@ -1,4 +1,6 @@
-> Latest experiment: [confirmed resource-ID consumption and native parser follow-up](external-track-resource-consumer.md).
+> Latest experiment: [0x78-byte object parser and common-header connection](external-track-vertex-parser.md).
+
+> Previous experiment: [confirmed resource-ID consumption and native parser follow-up](external-track-resource-consumer.md).
 
 > Previous experiment: [confirmed caller and selected reader consumer](external-track-confirmed-dispatch.md).
 

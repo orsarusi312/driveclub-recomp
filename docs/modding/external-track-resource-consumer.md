@@ -1,5 +1,9 @@
 # Confirmed resource-ID consumption and the missing vertex parser
 
+> Completed: the resource-consumer report succeeded. Continue with the targeted
+> [0x800759140 parser follow-up](external-track-vertex-parser.md); do not repeat
+> the successful wrapper/helper inspection or ID-copy game experiment.
+
 Continued clean local/remote `feat/external-track-foundation` at
 `4b43a065857f85bf966c3f27ccb76ee106ebad74`, matching uploaded commit.txt. No
 unfinished modifications were present. Read all uploaded evidence: stderr 64
