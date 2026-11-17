@@ -1,4 +1,6 @@
-> Latest experiment: [confirmed caller and selected reader consumer](external-track-confirmed-dispatch.md).
+> Latest experiment: [confirmed resource-ID consumption and native parser follow-up](external-track-resource-consumer.md).
+
+> Previous experiment: [confirmed caller and selected reader consumer](external-track-confirmed-dispatch.md).
 
 > Previous experiment: [scalar parsing and the unresolved dynamic selection edge](external-track-selection-edge.md).
 

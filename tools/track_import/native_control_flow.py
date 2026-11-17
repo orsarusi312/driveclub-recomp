@@ -7,10 +7,13 @@ are reported. A CALL's fallthrough is a syntactic possibility, not proof it retu
 """
 
 
-def walk(code, entry, decoder, instruction_limit=256, block_limit=32):
+def walk(code, entry, decoder, instruction_limit=256, block_limit=32, stop_at_call_targets=()):
     import capstone as cs
     if not 0 < len(code) <= 1024 or not 0 < instruction_limit <= 256 or not 0 < block_limit <= 32:
         raise ValueError('invalid static block-walk bounds')
+    if len(stop_at_call_targets) > 8 or any(not isinstance(x, int) or not 0 <= x < 2**64
+                                          for x in stop_at_call_targets):
+        raise ValueError('invalid reviewed call boundaries')
     pending, rows, occupied = [entry], {}, {}
     edges, calls, stops = [], [], []
     blocks = 0
@@ -57,6 +60,9 @@ def walk(code, entry, decoder, instruction_limit=256, block_limit=32):
                 target = target_of(ins)
                 calls.append({'at': hex(at), 'target': hex(target) if target is not None else None,
                               'operands': ins.op_str, 'scope': 'not followed; return/execution unproven'})
+                if target in stop_at_call_targets:
+                    # Analyst-selected cut, not an inferred noreturn attribute.
+                    stop(at, 'reviewed-call-boundary-return-unproven'); break
             # Capstone 5 classifies LOOP* as branch-relative but not JUMP.
             if ins.group(cs.CS_GRP_JUMP) or ins.mnemonic in ('loop', 'loope', 'loopne'):
                 target = target_of(ins)

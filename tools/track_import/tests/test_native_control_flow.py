@@ -57,6 +57,15 @@ class BlockWalkTests(unittest.TestCase):
         self.assertEqual(len(r['instructions']),1)
         self.assertEqual(r['edges'][0]['kind'],'return')
 
+    def test_reviewed_call_boundary_does_not_infer_return(self):
+        r=self.run_code('e801000000 c3 c3',stop_at_call_targets=(0x1006,))
+        self.assertEqual(len(r['instructions']),1)
+        self.assertEqual(r['stops'][0]['reason'],'reviewed-call-boundary-return-unproven')
+        self.assertEqual(r['calls'][0]['target'],'0x1006')
+        self.assertEqual(len(self.run_code('e801000000 c3 c3')['instructions']),2)
+        for values in [tuple(range(9)),(-1,),(2**64,),('0x1006',)]:
+            with self.assertRaises(ValueError): self.run_code('c3',stop_at_call_targets=values)
+
 
 if __name__ == '__main__':
     unittest.main()

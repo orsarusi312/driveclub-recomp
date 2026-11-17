@@ -38,6 +38,11 @@ PAYLOAD_END_CALLS = {0x8007ab640: 0x8007ab728,
                      0x8007601d0: 0x800760239,
                      0x80077bec0: 0x80077bfd8}
 PAYLOAD_FAILURE_TARGET = 0x80123e420
+CONSUMER_SLOT = 0x8015ed958
+CONSUMER_TARGET = 0x800742db0
+CONSUMER_HELPER_CALL = (0x800742de2, 0x800739c10)
+CONSUMER_ID_RETURN_CANDIDATE = 0x8007730fa
+CONSUMER_ID_HELPER = 0x800760240
 
 
 def need(ok, message):
@@ -373,11 +378,59 @@ def dispatch_details(image, decoder, vtable, observed_target):
     return result
 
 
+def resource_consumer_details(image, decoder):
+    from native_control_flow import walk
+    slot = image.relative_function(CONSUMER_SLOT)
+    need(int(slot['target'], 16) == CONSUMER_TARGET, 'confirmed consumer slot target mismatch')
+    call, helper = CONSUMER_HELPER_CALL
+    need(image.code(call, 5) == b'\xe8'+struct.pack('<i', helper-(call+5)),
+         'confirmed consumer helper call mismatch at '+hex(call))
+    result = {'schema': 'dc-resource-consumer-v1', 'linked_slot': slot,
+              'scope': 'fixed confirmed dispatch and direct callee; ID-reader caller remains a static candidate; no Road742 consumption or output ownership claim',
+              'limits': 'two entry windows (256/1024 bytes); one 384-byte candidate return window with at most two prologue leads; no image search or recursive call following',
+              'reviewed_call_boundary': hex(PAYLOAD_FAILURE_TARGET),
+              'boundary_caveat': 'stop at shared failure-path call without assigning a noreturn symbol',
+              'windows': []}
+    for target, size in ((CONSUMER_TARGET, 256), (helper, 1024)):
+        row = {'target': hex(target)}
+        try:
+            row.update(walk(image.code(target, size), target, decoder,
+                            stop_at_call_targets=(PAYLOAD_FAILURE_TARGET,)))
+        except ValueError as exc:
+            row['blocked'] = str(exc)
+        result['windows'].append(row)
+    ret = CONSUMER_ID_RETURN_CANDIDATE
+    candidate = {'return_candidate': hex(ret),
+                 'scope': 'lead from raw kv stack display, not a verified frame return or executed call'}
+    result['id_reader_caller_candidate'] = candidate
+    try:
+        expected = b'\xe8'+struct.pack('<i', CONSUMER_ID_HELPER-ret)
+        need(image.code(ret-5, 5) == expected, 'candidate is not the expected direct ID-helper call')
+        data = image.code(ret-128, 384)
+        candidate['call_encoding_matches'] = True
+        candidate['forward_from_return'] = walk(data[128:], ret, decoder,
+                                                stop_at_call_targets=(PAYLOAD_FAILURE_TARGET,))
+        anchors = [i for i in range(124) if data[i:i+4] == b'\x55\x48\x89\xe5']
+        candidate['prologue_leads_truncated'] = len(anchors) > 2
+        candidate['prologue_leads'] = []
+        for i in anchors[-2:]:
+            lead = walk(data[i:], ret-128+i, decoder, instruction_limit=128, block_limit=16,
+                        stop_at_call_targets=(PAYLOAD_FAILURE_TARGET,))
+            lead['call_boundary_matches'] = any(r['address'] == hex(ret-5) and r['bytes'] == expected.hex()
+                                                for r in lead['instructions'])
+            lead['boundary_status'] = 'prologue byte-pattern lead only, not a proven function entry'
+            candidate['prologue_leads'].append(lead)
+    except ValueError as exc:
+        candidate['blocked'] = str(exc)
+    return result
+
+
 def inspect(image_path, patch_path, include_reader_details=False, include_payload_details=False,
-            dispatch_vtable=None, dispatch_target=None):
+            dispatch_vtable=None, dispatch_target=None, include_resource_consumer=False):
     need((dispatch_vtable is None) == (dispatch_target is None), 'supply dispatch vtable and target together')
     include_dispatch = dispatch_vtable is not None
-    need(sum((include_reader_details, include_payload_details, include_dispatch)) <= 1, 'select one follow-up profile')
+    need(sum((include_reader_details, include_payload_details, include_dispatch, include_resource_consumer)) <= 1,
+         'select one follow-up profile')
     before = [digest(image_path), digest(patch_path)]
     with image_path.open('rb') as stream, patch_path.open('rb') as patches:
         image = Image(stream)
@@ -392,7 +445,7 @@ def inspect(image_path, patch_path, include_reader_details=False, include_payloa
                   'image_data_file_offset': image.data_offset,
                   'limits': 'three return windows, 512 bytes each; at most four 128-byte direct targets per site',
                   'caveat': 'linked bytes before runtime fixups; supplied patch/relocation overlaps blocked; guards do not prove whole-image runtime equivalence',
-                  'sites': [] if include_payload_details or include_dispatch else [site_report(image, address, decoder) for address in RETURNS]}
+                  'sites': [] if include_payload_details or include_dispatch or include_resource_consumer else [site_report(image, address, decoder) for address in RETURNS]}
         if include_reader_details:
             report['reader_details'] = reader_details(image, decoder)
         if include_payload_details:
@@ -401,6 +454,9 @@ def inspect(image_path, patch_path, include_reader_details=False, include_payloa
         if include_dispatch:
             report['limits'] = 'one supplied vtable slot +8 and a 256-byte/64-instruction first-block preview; no search'
             report['dispatch_details'] = dispatch_details(image, decoder, dispatch_vtable, dispatch_target)
+        if include_resource_consumer:
+            report['limits'] = 'confirmed resource consumer follow-up only; no earlier profiles or image searches repeated'
+            report['resource_consumer'] = resource_consumer_details(image, decoder)
     need(before == [digest(image_path), digest(patch_path)], 'input changed during inspection; discard report')
     return report
 
@@ -417,13 +473,15 @@ def main():
                         help='inspect three known helper targets; do not repeat earlier searches')
     profile.add_argument('--dispatch-vtable', type=lambda value: int(value, 0),
                         help='address point captured at 0x80077bf2b; inspect only slot +8')
+    profile.add_argument('--resource-consumer', action='store_true',
+                        help='inspect confirmed 0x742db0 -> 0x739c10 and one ID-helper caller lead offline')
     parser.add_argument('--dispatch-target', type=lambda value: int(value, 0),
                         help='target observed in that same stop (required with --dispatch-vtable)')
     args = parser.parse_args()
     try:
         need(not args.output.exists(), 'output already exists; use a fresh report path')
         report = inspect(args.image, args.patches, args.reader_details, args.payload_details,
-                         args.dispatch_vtable, args.dispatch_target)
+                         args.dispatch_vtable, args.dispatch_target, args.resource_consumer)
         with args.output.open('x', encoding='utf-8') as stream:
             json.dump(report, stream, indent=2)
             stream.write('\n')

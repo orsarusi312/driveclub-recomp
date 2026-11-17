@@ -1,5 +1,9 @@
 # Road742 investigation: the confirmed caller and its selected reader consumer
 
+> Completed: selector 3, target 0x800742db0 and an eight-byte ID read were observed.
+> Continue with the [offline native parser follow-up](external-track-resource-consumer.md).
+> Do not repeat this game experiment.
+
 Continued clean local/remote `feat/external-track-foundation` at
 `f1f39b2749eae042dcf71de97488bf9ebadde672`, matching uploaded commit.txt.
 Read all three logs: stdout 1,361 lines, stderr 65 lines, WinDbg retry 104,081
