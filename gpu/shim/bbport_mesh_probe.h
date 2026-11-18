@@ -145,7 +145,7 @@ inline bool ControlSample(Control& control,bool capture,uint64_t serial,uint64_t
     control.vertices=selected; control.bytes=bytes;
     return true;
 }
-struct Config { bool enabled=false, offline=false; Spec spec; const char* trigger=nullptr;
+struct Config { bool enabled=false, offline=false, paired=false; Spec spec, second; const char* trigger=nullptr;
     const char* offline_trigger=nullptr; };
 inline const Config& Configuration() {
     static const Config config=[] {
@@ -160,6 +160,15 @@ inline const Config& Configuration() {
         if(c.offline_trigger && !*c.offline_trigger) {
             c.offline=false;
             std::fputs("MeshProbe: empty offline trigger; offline matching disabled\n",stderr);
+        }
+        if(const char* second=BB_DIAGNOSTIC_ENV("BB_MESH_PROBE_SECOND")) {
+            c.paired=c.offline && Parse(second,c.second) && c.second.count!=c.spec.count &&
+                c.offline_trigger && *c.offline_trigger;
+            if(!c.paired) {
+                c.offline=false;
+                std::fputs("MeshProbe: invalid pair or missing trigger; offline matching disabled\n",stderr);
+            } else std::fprintf(stderr,"MeshProbe: pair configured counts=%u,%u; shared 4096-candidate budget per lane; 90-second deadline after arming\n",
+                               c.spec.count,c.second.count);
         }
         c.enabled=c.offline || c.trigger;
         if(c.enabled) std::fprintf(stderr,"MeshProbe: progressive-v2 enabled offline=%d control=%s; CPU backing bytes at direct draw recording, not visibility\n",
@@ -178,7 +187,10 @@ struct State {
     uintptr_t index=0, index_base=0;
     std::array<Binding,32> bindings{};
     Control control;
-    bool offline_armed=false, offline_finished=false;
+    bool offline_armed=false, offline_finished=false, offline_ended=false;
+    struct Coverage { uint32_t attempts=0, readable=0, index_matches=0, matches=0; };
+    std::array<Coverage,2> coverage{};
+    std::chrono::steady_clock::time_point offline_started{};
     uint32_t offline_attempts=0;
     uint64_t direct=0, indirect=0, serial=0, nonindexed=0, count_mismatch=0, count_equal=0,
         missing_index=0, index_read=0, index_range=0, index_type=0, index_prefix=0,
@@ -191,8 +203,31 @@ inline thread_local State state;
 inline bool OfflineActive() {
     const auto& c=Configuration();
     return c.offline && (!c.offline_trigger ||
-        (state.offline_armed && !state.offline_finished && state.offline_attempts<4096));
+        (state.offline_armed && !state.offline_finished && !state.offline_ended && state.offline_attempts<4096));
 }
+inline const Spec* SpecForCount(uint32_t count) {
+    const auto& c=Configuration();
+    if(count==c.spec.count) return &c.spec;
+    return c.paired && count==c.second.count ? &c.second : nullptr;
+}
+// Each recording lane owns its coverage and closes it on that same thread.
+// There is no cross-thread snapshot masquerading as a final result.
+inline void FinishPair() {
+    const auto& c=Configuration(); auto& s=state;
+    if(!c.paired || !s.offline_armed || s.offline_ended) return;
+    const char* reason=s.offline_finished ? "matched" : s.offline_attempts>=4096 ? "budget" :
+        std::chrono::steady_clock::now()-s.offline_started>=std::chrono::seconds(90) ? "deadline" : nullptr;
+    if(!reason) return;
+    s.offline_ended=true;
+    for(unsigned i=0;i<2;++i) {
+        const auto& v=s.coverage[i];
+        const char* outcome=v.matches ? "matched" : !v.attempts ? "no-coverage" :
+            !v.readable ? "unreadable-or-unbound" : "sampled-unmatched";
+        std::fprintf(stderr,"MeshProbe: pair-result lane=%u count=%u reason=%s outcome=%s attempts=%u index-readable=%u index-matches=%u paired-matches=%u; direct recorded draws only, no visibility claim\n",
+            s.lane,i ? c.second.count : c.spec.count,reason,outcome,v.attempts,v.readable,v.index_matches,v.matches);
+    }
+}
+struct PairCompletion { ~PairCompletion() { FinishPair(); } };
 inline void Progress() {
     const auto now=std::chrono::steady_clock::now();
     if(now-state.last<std::chrono::seconds(5)) return;
@@ -211,7 +246,7 @@ inline void Progress() {
     if(Configuration().offline && Configuration().offline_trigger)
         std::fprintf(stderr,"MeshProbe: lane=%u offline-status armed=%d attempts=%u/4096 matched=%d complete=%d\n",
             s.lane,int(s.offline_armed),s.offline_attempts,int(s.offline_finished),
-            int(s.offline_finished || s.offline_attempts>=4096));
+            int(s.offline_finished || s.offline_ended || s.offline_attempts>=4096));
     s.last=now;
 }
 inline void Begin(bool indexed,uint32_t count,bool indirect=false) {
@@ -219,6 +254,7 @@ inline void Begin(bool indexed,uint32_t count,bool indirect=false) {
     state.indexed=indexed && !indirect; state.bound=false; state.binding_count=0; state.count=count;
     ++state.serial;
     if(indirect) ++state.indirect; else ++state.direct;
+    FinishPair();
     Progress();
     const auto now=std::chrono::steady_clock::now();
     if(((c.trigger && !state.control.armed) || (c.offline && c.offline_trigger && !state.offline_armed)) &&
@@ -230,7 +266,7 @@ inline void Begin(bool indexed,uint32_t count,bool indirect=false) {
         }
         if(c.offline && c.offline_trigger && !state.offline_armed)
             if(FILE* f=std::fopen(c.offline_trigger,"rb")) {
-                std::fclose(f); state.offline_armed=true;
+                std::fclose(f); state.offline_armed=true; state.offline_started=now;
                 std::fprintf(stderr,"MeshProbe: lane=%u offline armed; 4096 equal-count candidates, one match; recorded draws only\n",state.lane);
             }
     }
@@ -242,7 +278,7 @@ inline void IndexBound(uintptr_t address,uint32_t width,uintptr_t base,uint32_t 
 inline void Observe(const Binding& b) {
     const auto& c=Configuration();
     if(!c.enabled || !state.indexed) return;
-    const bool candidate=OfflineActive() && state.count==c.spec.count;
+    const bool candidate=OfflineActive() && SpecForCount(state.count);
     const auto& control=state.control;
     if(!candidate && !(control.armed && !control.validated && control.attempts<4096 && state.count>=12 &&
                        (!control.captured || state.count==control.count))) return;
@@ -252,10 +288,16 @@ inline void Observe(const Binding& b) {
 inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) {
     const auto& c=Configuration(); if(!c.enabled) return;
     auto& s=state;
+    FinishPair();
+    PairCompletion completion;
     if(!s.indexed) { ++s.nonindexed; return; }
     s.indexed=false; // Never reuse this draw's state on another callback.
     if(count!=s.count) { ++s.stale_record; return; }
-    const bool active=OfflineActive(), offline=active && count==c.spec.count;
+    const Spec* selected=SpecForCount(count);
+    const Spec& spec=selected ? *selected : c.spec;
+    const bool active=OfflineActive(), offline=active && selected;
+    auto& coverage=s.coverage[c.paired && selected==&c.second ? 1 : 0];
+    if(offline && c.paired) ++coverage.attempts;
     if(active) ++(offline ? s.count_equal : s.count_mismatch);
     auto& control=s.control;
     const bool trial=control.armed && !control.validated && control.attempts<4096 && count>=12 &&
@@ -268,7 +310,11 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) 
     Indices indices;
     const Gate gate=ReadIndices(s.index,s.index_width,count,indices,runtime_memory_read_backing);
     int64_t delta=0;
-    const bool index_match=gate==Gate::Match && offline && IndexDelta(c.spec,indices,delta);
+    const bool index_match=gate==Gate::Match && offline && IndexDelta(spec,indices,delta);
+    if(offline && c.paired) {
+        if(gate==Gate::Match) ++coverage.readable;
+        if(index_match) ++coverage.index_matches;
+    }
     if(offline) {
         if(gate==Gate::Read) ++s.index_read;
         else if(gate==Gate::Range) ++s.index_range;
@@ -280,9 +326,9 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) 
             std::fprintf(stderr,"MeshProbe: lane=%u candidate ib=0x%llx base=0x%llx element-offset=%u width=%u count=%u read-status=%d index-match=%d delta=%lld prefix=%u,%u,%u expected=%u,%u,%u vs=%llx ps=%llx\n",
                 s.lane,(unsigned long long)s.index,(unsigned long long)s.index_base,s.index_offset,s.index_width,count,
                 int(gate),int(index_match),(long long)(index_match ? delta : 0),indices.values[0],indices.values[1],indices.values[2],
-                unsigned(c.spec.indices[0]|unsigned(c.spec.indices[1])<<8),
-                unsigned(c.spec.indices[2]|unsigned(c.spec.indices[3])<<8),
-                unsigned(c.spec.indices[4]|unsigned(c.spec.indices[5])<<8),
+                unsigned(spec.indices[0]|unsigned(spec.indices[1])<<8),
+                unsigned(spec.indices[2]|unsigned(spec.indices[3])<<8),
+                unsigned(spec.indices[4]|unsigned(spec.indices[5])<<8),
                 (unsigned long long)vs,(unsigned long long)ps);
         }
     }
@@ -293,7 +339,7 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) 
     for(unsigned i=0;i<s.binding_count;++i) {
         const Binding& b=s.bindings[i];
         if(offline && !position_match) {
-            Gate p=Positions(c.spec,b,index_match ? delta : 0,runtime_memory_read_backing);
+            Gate p=Positions(spec,b,index_match ? delta : 0,runtime_memory_read_backing);
             if(s.vertex_logs<6) {
                 ++s.vertex_logs;
                 std::fprintf(stderr,"MeshProbe: lane=%u vertex vb=0x%llx bytes=%llu stride=%u format=%u xyz-width=%u location=%u attr-offset=%u base-vertex=%d per-vertex=%d status=%d\n",
@@ -302,7 +348,7 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) 
             }
             if(b.base_vertex && (p==Gate::Prefix || p==Gate::Base || p==Gate::Range)) {
                 Binding zero=b; zero.base_vertex=0;
-                if(Positions(c.spec,zero,index_match ? delta : 0,runtime_memory_read_backing)==Gate::Match)
+                if(Positions(spec,zero,index_match ? delta : 0,runtime_memory_read_backing)==Gate::Match)
                     ++s.base_zero_match; // Diagnostic only; never promotes a draw to a match.
             }
             switch(p) {
@@ -332,14 +378,15 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) 
     if(position_match) {
         if(!index_match) ++s.position_unpaired;
         else {
+            if(c.paired) ++coverage.matches;
             auto& matches=delta ? s.rebased_recorded : s.exact_recorded;
             if(++matches<=10) std::fprintf(stderr,"MeshProbe: lane=%u offline-%s draw-recorded #%llu delta=%lld count=%u instances=%u vs=%llx ps=%llx; no visibility claim\n",
                 s.lane,delta ? "rebased" : "exact",(unsigned long long)matches,(long long)delta,count,instances,
                 (unsigned long long)vs,(unsigned long long)ps);
             if(c.offline_trigger) {
                 s.offline_finished=true;
-                std::fprintf(stderr,"MeshProbe: lane=%u offline paired-binding serial=%llu vb=0x%llx bytes=%llu stride=%u format=%u location=%u attr-offset=%u base-vertex=%d ib=0x%llx index-width=%u index-offset=%u; offline sampling complete; byte signature association only, not resource ownership or visible pixels\n",
-                    s.lane,(unsigned long long)s.serial,(unsigned long long)matched_binding.address,
+                std::fprintf(stderr,"MeshProbe: lane=%u offline paired-binding serial=%llu count=%u vb=0x%llx bytes=%llu stride=%u format=%u location=%u attr-offset=%u base-vertex=%d ib=0x%llx index-width=%u index-offset=%u; offline sampling complete; byte signature association only, not resource ownership or visible pixels\n",
+                    s.lane,(unsigned long long)s.serial,count,(unsigned long long)matched_binding.address,
                     (unsigned long long)matched_binding.size,matched_binding.stride,matched_binding.format,
                     matched_binding.location,matched_binding.offset,int32_t(matched_binding.base_vertex),
                     (unsigned long long)s.index,s.index_width,s.index_offset);

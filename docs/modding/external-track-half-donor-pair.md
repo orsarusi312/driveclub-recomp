@@ -1,5 +1,9 @@
 # Half-float consumed-resource pair: offline validation, no launch
 
+**The real offline pair validation passed.** Continue with the
+[one controlled two-signature runtime experiment](external-track-pair-runtime.md).
+Do not repeat the offline scan unless its input hashes changed.
+
 Recovered a clean branch at `25648877057c0e3651daecb06e908340edc537ec`, matching
 the fork, with no stashes. Preserved all existing experiments. The retained
 uploaded mesh reports contain only Road742, not the full report or this pair's

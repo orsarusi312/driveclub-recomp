@@ -17,6 +17,11 @@ static std::string Hex(const unsigned char* data,size_t size) {
 }
 int main(int argc,char** argv) {
     using namespace BbMeshProbe;
+#ifdef _WIN32
+    _putenv_s("BB_MESH_PROBE_SECOND","");
+#else
+    unsetenv("BB_MESH_PROBE_SECOND");
+#endif
     const bool control_only=argc==2 && !std::strcmp(argv[1],"--control-only");
     const bool bounded=argc==2 && !std::strcmp(argv[1],"--bounded-offline");
     const bool limit=argc==2 && !std::strcmp(argv[1],"--bounded-limit");

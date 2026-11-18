@@ -13,4 +13,8 @@ for mode in 0 1; do
     out/tests/mesh-probe-$mode.exe --bounded-offline
     out/tests/mesh-probe-$mode.exe --bounded-limit
     out/tests/mesh-probe-$mode.exe --half-pair
+    "$cxx" "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/mesh_probe_pair_test.cpp -o out/tests/mesh-probe-pair-$mode.exe
+    for case in match96 match186 budget no-coverage partial invalid same-count missing-trigger; do
+        out/tests/mesh-probe-pair-$mode.exe "$case"
+    done
 done

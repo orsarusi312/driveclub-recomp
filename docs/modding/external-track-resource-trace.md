@@ -1,4 +1,4 @@
-> Current decision: [retire parser breakpoints; guarded consumed-donor association](external-track-consumed-donor.md).
+> Current experiment: [one bounded run for both validated half-float donors](external-track-pair-runtime.md).
 
 > Previous decision: [final destination slot and one Road742 transfer test](external-track-destination-decision.md).
 

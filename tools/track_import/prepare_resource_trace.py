@@ -267,20 +267,88 @@ def prepare(dcmod, source, dependencies, target, relative, output):
     return report
 
 
+def prepare_consumed_probe(pair_file, source, relative, output):
+    """Revalidate recorded input hashes/bytes, then copy stock data. No rescan."""
+    source, output, pair_file = Path(source).resolve(), Path(output).resolve(), Path(pair_file).resolve()
+    if output.exists():
+        raise FileExistsError(output)
+    pair_hash = digest(pair_file)
+    with pair_file.open(encoding='utf-8-sig') as stream:
+        pair = json.load(stream)
+    if (pair['schema'] != 'dc-consumed-pair-1' or pair['signatures_distinct_in_report'] is not True
+            or pair['pair_distinguished_by_index_count'] is not True
+            or pair['vertex_span_ranges_overlap'] is not False or pair['index_ranges_overlap'] is not False
+            or pair['runtime_verified'] is not False or pair['selected_target'] is not None):
+        raise ValueError('pair evidence did not pass the expected offline gates')
+    hashes = pair['input_sha256']
+    if not isinstance(hashes, dict) or not 2 <= len(hashes) <= 8:
+        raise ValueError('missing bounded input hash set')
+    for name, expected in hashes.items():
+        if not re.fullmatch('[0-9a-f]{64}', expected) or digest(Path(name)) != expected:
+            raise ValueError(f'verified input changed or missing: {name}')
+    sources = [name for name in hashes if Path(name).resolve() == source]
+    reports = [name for name in hashes if Path(name).name == 'mesh-scan.json']
+    if len(sources) != 1 or len(reports) != 1:
+        raise ValueError('source/full report not uniquely identified by evidence hashes')
+    with Path(reports[0]).open(encoding='utf-8-sig') as stream:
+        full = json.load(stream)
+    rows = full['slots']
+    if not rows or full['scanned_slots'] != len(rows) or full['reported_slots'] != len(rows):
+        raise ValueError('incomplete hashed report')
+    candidates = pair['candidates']
+    if len(candidates) != 2 or {c['target'] for c in candidates} != set(CONSUMED_PAIR):
+        raise ValueError('unexpected donor pair; no substitution')
+    validated = []
+    for target in CONSUMED_PAIR:
+        matches = [r for r in rows if r['target'] == target]
+        if len(matches) != 1:
+            raise ValueError('target not unique in hashed report')
+        row = matches[0]
+        checked = validate_consumed_row(row, source, relative)
+        evidence = next(c for c in candidates if c['target'] == target)
+        for key, value in checked.items():
+            if evidence.get(key) != value:
+                raise ValueError(f'{target}: evidence differs from source/report ({key})')
+        if evidence['possible_signature_aliases_in_report'] or any(
+                possible_signature_alias(row, other) for other in rows if other['target'] != target):
+            raise ValueError('potential signature alias; no launch')
+        validated.append(checked)
+    output.mkdir(parents=True, exist_ok=False)
+    stock = output/'mods'/relative
+    stock.parent.mkdir(parents=True)
+    shutil.copyfile(source, stock)
+    if digest(stock) != hashes[sources[0]] or digest(pair_file) != pair_hash or any(
+            digest(Path(name)) != expected for name, expected in hashes.items()):
+        raise ValueError('input/copy changed during preparation; do not launch')
+    for candidate in validated:
+        (output/f"probe-{candidate['index_count']}.txt").write_text(candidate['draw_probe_signature']+'\n',encoding='ascii')
+    result = dict(schema='dc-consumed-probe-1', pair_sha256=pair_hash, input_sha256=hashes,
+                  stock_sha256=digest(stock), relative=relative, candidates=validated,
+                  scope='one stock-copy two-signature run; no geometry edits or native ownership claim')
+    (output/'preparation.json').write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--dcmod', type=Path, required=True)
+    parser.add_argument('--dcmod', type=Path)
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--dependency', type=Path, action='append', default=[])
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--target')
     mode.add_argument('--inspect-consumed-pair', type=Path, metavar='FULL_REPORT',
                       help='offline validation of the two observed half-float donor slots; no copies or launch')
+    mode.add_argument('--prepare-consumed-probe', type=Path, metavar='PAIR_REPORT',
+                      help='prepare verified stock copy and both signatures; no scan or launch')
     parser.add_argument('--relative', default='worlds/canada_road_circuit_02_n.rpk')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if not args.prepare_consumed_probe and not args.dcmod:
+        parser.error('--dcmod is required for target scanning')
     try:
-        if args.inspect_consumed_pair:
+        if args.prepare_consumed_probe:
+            report = prepare_consumed_probe(args.prepare_consumed_probe,args.source,args.relative,args.output)
+        elif args.inspect_consumed_pair:
             report = inspect_consumed_pair(args.dcmod.resolve(), args.source, args.dependency,
                                            args.inspect_consumed_pair, args.relative, args.output)
         else:
