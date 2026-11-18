@@ -436,6 +436,9 @@ Json ScanMeshes(const RpkPack& pack, const std::vector<Sub>& subs, const MeshFor
             stream.Set("selected_tangent", id == s.tangent_buffer);
             const Fields decoded = ParseFields(vb->deps.empty() ? nullptr : formats.Find(vb->deps[0]), Rd16(vb->data.data()+22));
             stream.Set("known_prefix_decodable", decoded.partial);
+            // Historical flag means partial-prefix decoding, not failure when false.
+            stream.Set("layout_decode_status", decoded.whole ? "complete" :
+                       decoded.partial ? "known_prefix_only" : "unavailable");
             stream.Set("normal_offset", decoded.normal); stream.Set("uv_offset", decoded.uv);
             stream.Set("tangent_offset", decoded.tangent);
             if (decoded.partial) {

@@ -3,7 +3,7 @@
 #include <string>
 #include <thread>
 #include <filesystem>
-static std::array<unsigned char,1024> memory{};
+static std::array<unsigned char,4096> memory{};
 static unsigned reads;
 extern "C" int runtime_memory_read_backing(uintptr_t address, void* out, uint64_t size) {
     ++reads;
@@ -20,11 +20,66 @@ int main(int argc,char** argv) {
     const bool control_only=argc==2 && !std::strcmp(argv[1],"--control-only");
     const bool bounded=argc==2 && !std::strcmp(argv[1],"--bounded-offline");
     const bool limit=argc==2 && !std::strcmp(argv[1],"--bounded-limit");
-    if(argc==2 && !control_only && !bounded && !limit) {
+    const bool half_pair=argc==2 && !std::strcmp(argv[1],"--half-pair");
+    if(argc==2 && !control_only && !bounded && !limit && !half_pair) {
         FILE* f=std::fopen(argv[1],"rb"); assert(f);
         char line[512]; assert(std::fgets(line,sizeof(line),f)); std::fclose(f);
         line[std::strcspn(line,"\r\n")]=0;
         Spec parsed; assert(Parse(line,parsed)); return 0;
+    }
+    if(half_pair) {
+        // Original synthetic pair: 28 + 64 vertices in a 92-record shared stream.
+        // Deliberately distinct counts (96/186); not inferred real slot ranges.
+        for(unsigned v=0;v<92;++v) for(unsigned axis=0;axis<3;++axis) {
+            const uint16_t h=uint16_t(0x3800+v+axis*128);
+            memory[512+v*12+axis*2]=uint8_t(h);
+            memory[513+v*12+axis*2]=uint8_t(h>>8);
+        }
+        for(unsigned i=0;i<186;++i) memory[2*i]=uint8_t(28+i%64);
+        std::string text="v1:12:6:8:186:28:";
+        for(unsigned v=28;v<36;++v) text+=Hex(memory.data()+512+v*12,6);
+        text+=':'+Hex(memory.data(),48);
+        Spec half; assert(Parse(text,half));
+        Binding binding{0x1200,92*12,12,0,6,97,0,0,true};
+        assert(Positions(half,binding,0,runtime_memory_read_backing)==Gate::Match);
+        memory[512+28*12+6]^=0xff; // Padding/normal bytes are not XYZ.
+        assert(Positions(half,binding,0,runtime_memory_read_backing)==Gate::Match);
+        memory[512+28*12]^=1;
+        assert(Positions(half,binding,0,runtime_memory_read_backing)==Gate::Prefix);
+        memory[512+28*12]^=1;
+        Binding bad=binding; bad.width=12;
+        assert(Positions(half,bad,0,runtime_memory_read_backing)==Gate::Format);
+        bad=binding; bad.size=28*12+5;
+        assert(Positions(half,bad,0,runtime_memory_read_backing)==Gate::Range);
+        bad=binding; bad.base_vertex=uint32_t(-29);
+        assert(Positions(half,bad,0,runtime_memory_read_backing)==Gate::Base);
+        bad=binding; bad.offset=4; bad.address-=4; bad.size+=4;
+        assert(Positions(half,bad,0,runtime_memory_read_backing)==Gate::Match);
+#ifdef _WIN32
+        _putenv_s("BB_MESH_PROBE",text.c_str());
+        _putenv_s("BB_MESH_PROBE_CONTROL",""); _putenv_s("BB_MESH_PROBE_TRIGGER","");
+#else
+        setenv("BB_MESH_PROBE",text.c_str(),1);
+        unsetenv("BB_MESH_PROBE_CONTROL"); unsetenv("BB_MESH_PROBE_TRIGGER");
+#endif
+        auto draw=[&](uint32_t count) {
+            Begin(true,count); Observe(binding); IndexBound(0x1000,2,0x1000,0);
+            Recorded(1,2,count,1);
+        };
+        auto before=memory; auto read_count=reads;
+        draw(96); // Other slot's count must be rejected before any byte sampling.
+        assert(reads==read_count);
+        draw(186);
+        if constexpr(BB_DIAGNOSTICS) assert(state.exact_recorded==1);
+        else assert(reads==read_count);
+        assert(memory==before);
+        // Native index rebasing and corresponding signed base vertex stay paired.
+        for(unsigned i=0;i<186;++i) memory[2*i]-=28;
+        binding.base_vertex=28; before=memory; draw(186);
+        if constexpr(BB_DIAGNOSTICS) assert(state.rebased_recorded==1);
+        assert(memory==before);
+        std::puts("half pair: raw six-byte matching, separate counts, rebasing, offsets, bounds and OFF gate passed");
+        return 0;
     }
     Spec spec;
     for(unsigned i=0;i<36;++i) spec.positions[i]=static_cast<unsigned char>(i+1);

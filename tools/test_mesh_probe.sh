@@ -12,4 +12,5 @@ for mode in 0 1; do
     out/tests/mesh-probe-$mode.exe --control-only
     out/tests/mesh-probe-$mode.exe --bounded-offline
     out/tests/mesh-probe-$mode.exe --bounded-limit
+    out/tests/mesh-probe-$mode.exe --half-pair
 done

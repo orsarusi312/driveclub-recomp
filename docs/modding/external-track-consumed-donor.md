@@ -1,5 +1,9 @@
 # Retire the Road742 parser breakpoint; test one consumed-resource signature
 
+**The precheck returned two half-float slots. Do not use the launch procedure below.**
+Continue with [offline half-float pair validation](external-track-half-donor-pair.md).
+The original float-only gate and single-row assumption are historical.
+
 ## Recovery and decision
 
 Recovered HEAD and fork at `29e3352370dd4f0bc4a61c0091efb2959dba9f92`,

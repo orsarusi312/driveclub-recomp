@@ -72,7 +72,37 @@ class MultiStreamTests(unittest.TestCase):
         self.assertEqual(pos['normal_offset'],12); self.assertEqual(attr['uv_offset'],0)
         self.assertEqual(attr['opaque_suffix_offset'],8); self.assertEqual(attr['opaque_suffix_bytes'],4)
         self.assertFalse(attr['fields'][1]['byte_width_supported'])
+        self.assertEqual(pos['layout_decode_status'], 'complete')
+        self.assertEqual(attr['layout_decode_status'], 'known_prefix_only')
         self.assertIn('unknown_suffix', ' '.join(slot['limitations']))
+
+    def test_complete_half_position_normal_stream_signature_and_export(self):
+        from test_resource_trace import trace
+        from test_track_import import t
+        self.posfmt = 0x0002874b47ba4c22
+        next(r for r in self.doc['resources'] if r['id']==f'{self.pos:016x}')['deps']=[f'{self.posfmt:016x}']
+        self.format(self.posfmt, [(1,6,0),(2,15,0)])
+        self.format(self.attrfmt, [(5,8,0)])
+        pos=self.resource(self.pos); data=bytearray(pos.read_bytes()[:28])
+        struct.pack_into('<H',data,22,12)
+        for i in range(12): data.extend(struct.pack('<3eHI',i/8,0,i%2,0xffff,511<<10))
+        pos.write_bytes(data)
+        attr=self.resource(self.attr); data=bytearray(attr.read_bytes()[:28])
+        struct.pack_into('<H',data,22,8)
+        for i in range(12): data.extend(struct.pack('<ff',i/12,0.25))
+        attr.write_bytes(data); self.build(); before=self.pack.read_bytes()
+        slot=self.scan()['slots'][0]
+        self.assertTrue(slot['compatible']); self.assertTrue(slot['position_half_float'])
+        self.assertFalse(slot['partial_layout'])
+        stream=next(v for v in slot['vertex_streams'] if v['id']==f'{self.pos:016x}')
+        self.assertFalse(stream['known_prefix_decodable'])
+        self.assertEqual(stream['layout_decode_status'],'complete')
+        self.assertEqual(stream['normal_offset'],8)
+        self.assertTrue(slot['draw_probe_signature'].startswith('v1:12:6:8:3:0:'))
+        self.assertIn('prefix ',trace.manifest(slot,self.pack,'worlds/test.rpk'))
+        output=self.root/'half.glb'; self.cli('mesh','export',self.pack,'-o',output,slot['target'])
+        self.assertEqual(t.read_glb(output)['positions'],[[i/8,0,i%2] for i in range(12)])
+        self.assertEqual(self.pack.read_bytes(),before)
 
     def test_isolated_stage_preserves_neighbor_and_opaque_bytes(self):
         from test_track_import import t
