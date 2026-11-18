@@ -145,7 +145,8 @@ inline bool ControlSample(Control& control,bool capture,uint64_t serial,uint64_t
     control.vertices=selected; control.bytes=bytes;
     return true;
 }
-struct Config { bool enabled=false, offline=false; Spec spec; const char* trigger=nullptr; };
+struct Config { bool enabled=false, offline=false; Spec spec; const char* trigger=nullptr;
+    const char* offline_trigger=nullptr; };
 inline const Config& Configuration() {
     static const Config config=[] {
         Config c;
@@ -155,9 +156,16 @@ inline const Config& Configuration() {
         }
         c.trigger=BB_DIAGNOSTIC_ENV("BB_MESH_PROBE_CONTROL");
         if(c.trigger && !*c.trigger) c.trigger=nullptr;
+        c.offline_trigger=BB_DIAGNOSTIC_ENV("BB_MESH_PROBE_TRIGGER");
+        if(c.offline_trigger && !*c.offline_trigger) {
+            c.offline=false;
+            std::fputs("MeshProbe: empty offline trigger; offline matching disabled\n",stderr);
+        }
         c.enabled=c.offline || c.trigger;
         if(c.enabled) std::fprintf(stderr,"MeshProbe: progressive-v2 enabled offline=%d control=%s; CPU backing bytes at direct draw recording, not visibility\n",
                                   int(c.offline),c.trigger ? "waiting-for-trigger-file" : "off");
+        if(c.offline && c.offline_trigger)
+            std::fputs("MeshProbe: offline waiting-for-trigger-file; 4096 equal-count candidates per lane; stop on first paired match\n",stderr);
         return c;
     }();
     return config;
@@ -170,6 +178,8 @@ struct State {
     uintptr_t index=0, index_base=0;
     std::array<Binding,32> bindings{};
     Control control;
+    bool offline_armed=false, offline_finished=false;
+    uint32_t offline_attempts=0;
     uint64_t direct=0, indirect=0, serial=0, nonindexed=0, count_mismatch=0, count_equal=0,
         missing_index=0, index_read=0, index_range=0, index_type=0, index_prefix=0,
         index_exact=0, index_rebased=0, stride=0, format=0, base=0, range=0, vertex_read=0,
@@ -178,6 +188,11 @@ struct State {
     std::chrono::steady_clock::time_point last=std::chrono::steady_clock::now(), poll=last-std::chrono::seconds(2);
 };
 inline thread_local State state;
+inline bool OfflineActive() {
+    const auto& c=Configuration();
+    return c.offline && (!c.offline_trigger ||
+        (state.offline_armed && !state.offline_finished && state.offline_attempts<4096));
+}
 inline void Progress() {
     const auto now=std::chrono::steady_clock::now();
     if(now-state.last<std::chrono::seconds(5)) return;
@@ -193,6 +208,10 @@ inline void Progress() {
         (unsigned long long)s.exact_recorded,(unsigned long long)s.rebased_recorded,(unsigned long long)s.stale_record,
         (unsigned long long)s.base_zero_match,
         s.control.attempts,(unsigned long long)s.control_index_fail,int(s.control.captured),int(s.control.validated));
+    if(Configuration().offline && Configuration().offline_trigger)
+        std::fprintf(stderr,"MeshProbe: lane=%u offline-status armed=%d attempts=%u/4096 matched=%d complete=%d\n",
+            s.lane,int(s.offline_armed),s.offline_attempts,int(s.offline_finished),
+            int(s.offline_finished || s.offline_attempts>=4096));
     s.last=now;
 }
 inline void Begin(bool indexed,uint32_t count,bool indirect=false) {
@@ -202,12 +221,18 @@ inline void Begin(bool indexed,uint32_t count,bool indirect=false) {
     if(indirect) ++state.indirect; else ++state.direct;
     Progress();
     const auto now=std::chrono::steady_clock::now();
-    if(c.trigger && !state.control.armed && now-state.poll>=std::chrono::seconds(1)) {
+    if(((c.trigger && !state.control.armed) || (c.offline && c.offline_trigger && !state.offline_armed)) &&
+       now-state.poll>=std::chrono::seconds(1)) {
         state.poll=now;
-        if(FILE* f=std::fopen(c.trigger,"rb")) {
+        if(c.trigger && !state.control.armed) if(FILE* f=std::fopen(c.trigger,"rb")) {
             std::fclose(f); state.control.armed=true;
             std::fprintf(stderr,"MeshProbe: lane=%u positive-control armed; budget=4096 sampled draws\n",state.lane);
         }
+        if(c.offline && c.offline_trigger && !state.offline_armed)
+            if(FILE* f=std::fopen(c.offline_trigger,"rb")) {
+                std::fclose(f); state.offline_armed=true;
+                std::fprintf(stderr,"MeshProbe: lane=%u offline armed; 4096 equal-count candidates, one match; recorded draws only\n",state.lane);
+            }
     }
 }
 inline void IndexBound(uintptr_t address,uint32_t width,uintptr_t base,uint32_t offset) {
@@ -217,7 +242,7 @@ inline void IndexBound(uintptr_t address,uint32_t width,uintptr_t base,uint32_t 
 inline void Observe(const Binding& b) {
     const auto& c=Configuration();
     if(!c.enabled || !state.indexed) return;
-    const bool candidate=c.offline && state.count==c.spec.count;
+    const bool candidate=OfflineActive() && state.count==c.spec.count;
     const auto& control=state.control;
     if(!candidate && !(control.armed && !control.validated && control.attempts<4096 && state.count>=12 &&
                        (!control.captured || state.count==control.count))) return;
@@ -230,12 +255,14 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) 
     if(!s.indexed) { ++s.nonindexed; return; }
     s.indexed=false; // Never reuse this draw's state on another callback.
     if(count!=s.count) { ++s.stale_record; return; }
-    const bool offline=c.offline && count==c.spec.count;
-    if(c.offline) ++(offline ? s.count_equal : s.count_mismatch);
+    const bool active=OfflineActive(), offline=active && count==c.spec.count;
+    if(active) ++(offline ? s.count_equal : s.count_mismatch);
     auto& control=s.control;
     const bool trial=control.armed && !control.validated && control.attempts<4096 && count>=12 &&
         (!control.captured || (count==control.count && vs==control.vs && ps==control.ps));
     if(!offline && !trial) return;
+    if(offline && c.offline_trigger && ++s.offline_attempts==4096)
+        std::fprintf(stderr,"MeshProbe: lane=%u offline final candidate; budget=4096; no further offline samples\n",s.lane);
     if(!s.bound) { ++s.missing_index; return; }
     if(trial) ++control.attempts;
     Indices indices;
@@ -262,6 +289,7 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) 
     if(trial && gate!=Gate::Match) ++s.control_index_fail;
     if(!s.binding_count) ++s.no_bindings;
     bool position_match=false;
+    Binding matched_binding{};
     for(unsigned i=0;i<s.binding_count;++i) {
         const Binding& b=s.bindings[i];
         if(offline && !position_match) {
@@ -284,7 +312,7 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) 
             case Gate::Range: ++s.range; break;
             case Gate::Read: ++s.vertex_read; break;
             case Gate::Prefix: ++s.position_prefix; break;
-            case Gate::Match: position_match=true; break;
+            case Gate::Match: position_match=true; matched_binding=b; break;
             default: break;
             }
         }
@@ -308,6 +336,14 @@ inline void Recorded(uint64_t vs,uint64_t ps,uint32_t count,uint32_t instances) 
             if(++matches<=10) std::fprintf(stderr,"MeshProbe: lane=%u offline-%s draw-recorded #%llu delta=%lld count=%u instances=%u vs=%llx ps=%llx; no visibility claim\n",
                 s.lane,delta ? "rebased" : "exact",(unsigned long long)matches,(long long)delta,count,instances,
                 (unsigned long long)vs,(unsigned long long)ps);
+            if(c.offline_trigger) {
+                s.offline_finished=true;
+                std::fprintf(stderr,"MeshProbe: lane=%u offline paired-binding serial=%llu vb=0x%llx bytes=%llu stride=%u format=%u location=%u attr-offset=%u base-vertex=%d ib=0x%llx index-width=%u index-offset=%u; offline sampling complete; byte signature association only, not resource ownership or visible pixels\n",
+                    s.lane,(unsigned long long)s.serial,(unsigned long long)matched_binding.address,
+                    (unsigned long long)matched_binding.size,matched_binding.stride,matched_binding.format,
+                    matched_binding.location,matched_binding.offset,int32_t(matched_binding.base_vertex),
+                    (unsigned long long)s.index,s.index_width,s.index_offset);
+            }
         }
     }
     if(trial && control.attempts==4096 && !control.validated)

@@ -18,7 +18,9 @@ static std::string Hex(const unsigned char* data,size_t size) {
 int main(int argc,char** argv) {
     using namespace BbMeshProbe;
     const bool control_only=argc==2 && !std::strcmp(argv[1],"--control-only");
-    if(argc==2 && !control_only) {
+    const bool bounded=argc==2 && !std::strcmp(argv[1],"--bounded-offline");
+    const bool limit=argc==2 && !std::strcmp(argv[1],"--bounded-limit");
+    if(argc==2 && !control_only && !bounded && !limit) {
         FILE* f=std::fopen(argv[1],"rb"); assert(f);
         char line[512]; assert(std::fgets(line,sizeof(line),f)); std::fclose(f);
         line[std::strcspn(line,"\r\n")]=0;
@@ -93,12 +95,69 @@ int main(int argc,char** argv) {
     assert(std::filesystem::create_directory(root));
     const auto trigger=(root/"arm").string();
 #ifdef _WIN32
+    _putenv_s("BB_MESH_PROBE_TRIGGER","");
     _putenv_s("BB_MESH_PROBE",control_only ? "" : text.c_str());
     _putenv_s("BB_MESH_PROBE_CONTROL",trigger.c_str());
 #else
+    unsetenv("BB_MESH_PROBE_TRIGGER");
     if(control_only) unsetenv("BB_MESH_PROBE"); else setenv("BB_MESH_PROBE",text.c_str(),1);
     setenv("BB_MESH_PROBE_CONTROL",trigger.c_str(),1);
 #endif
+    if(bounded || limit) {
+#ifdef _WIN32
+        _putenv_s("BB_MESH_PROBE_CONTROL","");
+        _putenv_s("BB_MESH_PROBE_TRIGGER",trigger.c_str());
+#else
+        unsetenv("BB_MESH_PROBE_CONTROL");
+        setenv("BB_MESH_PROBE_TRIGGER",trigger.c_str(),1);
+#endif
+        auto draw=[&](uint32_t count,uintptr_t index,bool bind=true) {
+            Begin(true,count); Observe(b);
+            if(bind) IndexBound(index,2,index,0);
+            Recorded(1,2,count,1);
+        };
+        before=reads;
+        draw(3,0x1000);
+        assert(reads==before && !state.offline_armed && !state.binding_count);
+        FILE* flag=std::fopen(trigger.c_str(),"wb"); assert(flag); std::fclose(flag);
+        state.poll-=std::chrono::seconds(2);
+        draw(6,0x1000);
+        assert(reads==before && !state.offline_attempts);
+        if constexpr (BB_DIAGNOSTICS) {
+            assert(state.offline_armed);
+            if(limit) {
+                // Missing index bindings also consume the candidate budget.
+                for(unsigned i=0;i<4095;++i) draw(3,0x1000,false);
+                assert(reads==before && state.offline_attempts==4095);
+                draw(3,0x8000); // Last candidate: failed read, no match.
+                assert(state.offline_attempts==4096 && !state.offline_finished);
+                before=reads; draw(3,0x1000);
+                assert(reads==before && state.exact_recorded==0 && !state.binding_count);
+            } else {
+                draw(3,0x1000);
+                assert(state.offline_attempts==1 && state.offline_finished && state.exact_recorded==1);
+                before=reads; Recorded(1,2,3,1); draw(3,0x1000);
+                assert(reads==before && state.exact_recorded==1 && !state.binding_count);
+            }
+            std::filesystem::remove(trigger);
+            flag=std::fopen(trigger.c_str(),"wb"); assert(flag); std::fclose(flag);
+            state.poll-=std::chrono::seconds(2);
+            before=reads; draw(3,0x1000); assert(reads==before); // No rearming.
+            const auto attempts=state.offline_attempts;
+            std::thread worker([&] {
+                assert(!state.offline_armed && state.offline_attempts==0);
+                draw(3,0x1000);
+                assert(state.offline_finished && state.offline_attempts==1);
+            }); worker.join();
+            assert(state.offline_attempts==attempts); // Recording lanes independent.
+        } else {
+            draw(3,0x1000); assert(reads==before && !Configuration().enabled);
+        }
+        assert(memory==original);
+        std::filesystem::remove_all(root);
+        std::puts("bounded offline probe: trigger, candidate cap, terminal match, no rearm, lane isolation and OFF gate passed");
+        return 0;
+    }
     if(control_only) {
         for(unsigned i=0;i<12;++i) memory[2*i]=static_cast<unsigned char>(i%3);
         FILE* flag=std::fopen(trigger.c_str(),"wb"); assert(flag); std::fclose(flag);

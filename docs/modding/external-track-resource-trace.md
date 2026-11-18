@@ -1,4 +1,4 @@
-> Latest experiment: [arm before the first RPK open](external-track-early-open.md).
+> Current decision: [retire parser breakpoints; guarded consumed-donor association](external-track-consumed-donor.md).
 
 > Previous decision: [final destination slot and one Road742 transfer test](external-track-destination-decision.md).
 

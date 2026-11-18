@@ -2,7 +2,7 @@
 
 > Completed Windows run: +0x38 resolved to 0x800759400, but the late-armed filter
 > saw 874 candidates and no Road742 match. Do not repeat that arming point.
-> Continue with the [first-open gate and bounded transfer test](external-track-early-open.md).
+> That test is complete. Continue with the [consumed-donor decision](external-track-consumed-donor.md); do not repeat the parser breakpoint.
 
 Recovered clean local and remote `feat/external-track-foundation` at
 `88c6604b12332c02d4d02d3538e6f24cbfa0ecf2`. No unfinished changes were present.

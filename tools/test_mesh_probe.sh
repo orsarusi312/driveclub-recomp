@@ -10,4 +10,6 @@ for mode in 0 1; do
     "$cxx" "${flags[@]}" -DBB_DIAGNOSTICS=$mode tools/mesh_probe_test.cpp -o out/tests/mesh-probe-$mode.exe
     out/tests/mesh-probe-$mode.exe
     out/tests/mesh-probe-$mode.exe --control-only
+    out/tests/mesh-probe-$mode.exe --bounded-offline
+    out/tests/mesh-probe-$mode.exe --bounded-limit
 done

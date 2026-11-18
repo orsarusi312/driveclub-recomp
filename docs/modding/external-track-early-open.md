@@ -1,5 +1,8 @@
 # Road742: arm before the first RPK open, not after the second read
 
+**Historical experiment, now completed. Do not repeat it.** See
+[the consumed-donor decision and guarded next action](external-track-consumed-donor.md).
+
 Recovered clean local/remote `feat/external-track-foundation` at
 `7e0dee6eec8af14c93ed7cba844135093f08536a`; no unfinished work was present.
 Read all four supplied logs, including the complete 156,247-line WinDbg log.
